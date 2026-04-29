@@ -1,0 +1,4 @@
+flask
+flask-socketio
+eventlet==0.33.3
+ccxt==4.3.88

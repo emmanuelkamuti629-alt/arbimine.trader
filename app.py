@@ -3,16 +3,25 @@ monkey.patch_all()
 
 import time
 import os
+import logging
 from flask import Flask
 from flask_socketio import SocketIO
 import ccxt
-import logging
+from concurrent.futures import ThreadPoolExecutor
 
+# =============================
+# SETUP
+# =============================
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
+executor = ThreadPoolExecutor(max_workers=20)
+
+# =============================
+# EXCHANGES
+# =============================
 exchanges = {
     "mexc": ccxt.mexc({"enableRateLimit": True}),
     "kucoin": ccxt.kucoin({"enableRateLimit": True}),
@@ -23,40 +32,32 @@ exchanges = {
 for name, ex in exchanges.items():
     try:
         ex.load_markets()
-        logging.info(f"Loaded {name}: {len(ex.markets)} markets")
+        logging.info(f"{name} markets loaded: {len(ex.markets)}")
     except Exception as e:
-        logging.error(f"Failed to load {name}: {e}")
+        logging.error(f"{name} failed: {e}")
 
 # =============================
-# SYMBOLS - All coins from your lists
+# BUILD COMMON SYMBOL LIST (IMPORTANT FIX)
 # =============================
-symbols = [
-    # Majors
-    "BTC/USDT", "ETH/USDT", "USDT/USDC", "BNB/USDT", "SOL/USDT", "XRP/USDT",
-    "ADA/USDT", "DOGE/USDT", "TRX/USDT", "BCH/USDT",
-    
-    # L1s / L2s
-    "AVAX/USDT", "DOT/USDT", "ATOM/USDT", "NEAR/USDT", "APT/USDT", "SUI/USDT",
-    "SEI/USDT", "INJ/USDT", "FTM/USDT", "ICP/USDT", "THETA/USDT", "KAS/USDT",
-    "ARB/USDT", "OP/USDT", "MATIC/USDT", "POL/USDT", "STX/USDT",
-    
-    # DeFi
-    "LINK/USDT", "UNI/USDT", "AAVE/USDT", "MKR/USDT", "LDO/USDT", "RUNE/USDT",
-    "SNX/USDT", "GRT/USDT", "DYDX/USDT", "GMX/USDT", "JUP/USDT",
-    
-    # Storage / Infra / AI
-    "FIL/USDT", "RNDR/USDT", "IMX/USDT", "ARKM/USDT", "WLD/USDT",
-    
-    # Memes
-    "SHIB/USDT", "PEPE/USDT", "FLOKI/USDT", "WIF/USDT", "BONK/USDT", "LUNC/USDT",
-    
-    # Misc
-    "LTC/USDT"
-]
+common_symbols = set(exchanges["mexc"].markets)
 
+for ex in exchanges.values():
+    common_symbols &= set(ex.markets)
+
+symbols = list(common_symbols)
+
+logging.info(f"Common symbols found: {len(symbols)}")
+
+# fallback if too small
+if len(symbols) < 10:
+    symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
+
+# =============================
+# CONFIG
+# =============================
 ORDERBOOKS = {}
-MIN_PROFIT = 0.05 # After fees
-MAX_AGE = 10 # Ignore data older than 10s
+MIN_PROFIT = 0.01   # lowered for detection
+MAX_AGE = 10
 
 FEES = {
     "mexc": 0.001,
@@ -65,9 +66,11 @@ FEES = {
     "coinex": 0.002
 }
 
+# =============================
+# ORDERBOOK STORAGE
+# =============================
 def update_orderbook(exchange, symbol, bid, ask, bid_vol, ask_vol):
-    key = f"{exchange}:{symbol}"
-    ORDERBOOKS[key] = {
+    ORDERBOOKS[f"{exchange}:{symbol}"] = {
         "bid": bid,
         "ask": ask,
         "bid_vol": bid_vol,
@@ -75,74 +78,91 @@ def update_orderbook(exchange, symbol, bid, ask, bid_vol, ask_vol):
         "time": time.time()
     }
 
+# =============================
+# FETCH DATA (THREAD SAFE)
+# =============================
+def fetch_orderbook(ex_name, ex, sym):
+    try:
+        if sym not in ex.markets:
+            return
+
+        ob = ex.fetch_order_book(sym, limit=5)
+        bids = ob.get("bids")
+        asks = ob.get("asks")
+
+        if bids and asks and bids[0] and asks[0]:
+            update_orderbook(
+                ex_name,
+                sym,
+                bids[0][0],
+                asks[0][0],
+                bids[0][1],
+                asks[0][1]
+            )
+
+    except Exception as e:
+        logging.warning(f"{ex_name} {sym}: {e}")
+
+# =============================
+# STREAM LOOP
+# =============================
 def stream_data():
     while True:
+        tasks = []
+
         for ex_name, ex in exchanges.items():
             for sym in symbols:
-                try:
-                    if sym not in ex.markets:
-                        continue
-                    
-                    orderbook = ex.fetch_order_book(sym, limit=5)
-                    bids = orderbook.get("bids")
-                    asks = orderbook.get("asks")
+                tasks.append(executor.submit(fetch_orderbook, ex_name, ex, sym))
 
-                    if bids and asks and bids[0] and asks[0]:
-                        update_orderbook(
-                            ex_name, sym, 
-                            bids[0][0], asks[0][0], # price
-                            bids[0][1], asks[0][1] # volume
-                        )
-                    
-                except ccxt.RateLimitExceeded:
-                    logging.warning(f"{ex_name} rate limited. Sleeping 10s")
-                    socketio.sleep(10)
-                except Exception as e:
-                    logging.warning(f"{ex_name} {sym} error: {e}")
-                
-                socketio.sleep(0.3) # 0.3s * 200 pairs = 60s per full loop
-        
+        # allow tasks to complete
+        for t in tasks:
+            try:
+                t.result(timeout=5)
+            except:
+                pass
+
         socketio.sleep(1)
 
+# =============================
+# ARBITRAGE DETECTOR
+# =============================
 def detect_arbitrage():
     now = time.time()
-    grouped = {}
+    grouped = []
     results = []
+
+    data = {}
 
     for k, v in ORDERBOOKS.items():
         if now - v["time"] > MAX_AGE:
             continue
         try:
             ex, sym = k.split(":", 1)
-            grouped.setdefault(sym, {})[ex] = v
+            data.setdefault(sym, {})[ex] = v
         except:
             continue
 
-    for sym, data in grouped.items():
-        ex_list = list(data.keys())
+    for sym, ex_data in data.items():
+        ex_list = list(ex_data.keys())
+
         for buy_ex in ex_list:
             for sell_ex in ex_list:
                 if buy_ex == sell_ex:
                     continue
 
-                buy_data = data[buy_ex]
-                sell_data = data[sell_ex]
-                
-                buy = buy_data["ask"]
-                sell = sell_data["bid"]
-                
+                buy = ex_data[buy_ex]["ask"]
+                sell = ex_data[sell_ex]["bid"]
+
                 if not buy or not sell:
                     continue
 
-                fee_cost = (FEES.get(buy_ex, 0) + FEES.get(sell_ex, 0)) * 100
-                profit = ((sell - buy) / buy) * 100 - fee_cost
-                
-                # Basic slippage check: need $100 liquidity on both sides
-                min_liq_usd = 100
-                buy_liq = buy * buy_data["ask_vol"]
-                sell_liq = sell * sell_data["bid_vol"]
+                fee = (FEES.get(buy_ex, 0) + FEES.get(sell_ex, 0)) * 100
+                profit = ((sell - buy) / buy) * 100 - fee
 
-                if MIN_PROFIT < profit < 5 and buy_liq > min_liq_usd and sell_liq > min_liq_usd:
+                buy_liq = buy * ex_data[buy_ex]["ask_vol"]
+                sell_liq = sell * ex_data[sell_ex]["bid_vol"]
+
+                if profit > MIN_PROFIT and buy_liq > 100 and sell_liq > 100:
                     results.append({
                         "symbol": sym,
                         "buy": buy_ex,
@@ -154,35 +174,48 @@ def detect_arbitrage():
 
     return sorted(results, key=lambda x: x["profit"], reverse=True)
 
+# =============================
+# FRONTEND
+# =============================
 HTML = """
 <!DOCTYPE html>
 <html>
-<head><title>Real Arbitrage Scanner</title>
+<head>
+<title>Arbitrage Scanner</title>
 <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
 </head>
 <body style="background:#0f0f0f;color:white;font-family:Arial;padding:20px">
-<h2>🔥 REAL Arbitrage Scanner (LIVE)</h2>
-<div id="status" style="color:#888;margin-bottom:10px">Waiting for data...</div>
+
+<h2>🔥 Live Arbitrage Scanner</h2>
+<div id="status">Loading...</div>
 <div id="data"></div>
+
 <script>
 const socket = io();
+
 socket.on("update", function(data) {
-    document.getElementById("status").innerHTML = `Last update: ${new Date().toLocaleTimeString()} | Pairs tracking: ${data.pairs_checked} | Opportunities: ${data.opportunities.length}`;
+    document.getElementById("status").innerHTML =
+        `Pairs: ${data.pairs} | Opportunities: ${data.opps.length}`;
+
     let html = "";
-    if(data.opportunities.length === 0){
-        html = "<p>No real arbitrage opportunities above 0.05% after fees</p>";
+
+    if (data.opps.length === 0) {
+        html = "<p>No opportunities right now</p>";
     }
-    data.opportunities.forEach(d => {
+
+    data.opps.forEach(d => {
         html += `
-        <div style="margin:10px;padding:10px;border:1px solid #333;border-radius:8px">
+        <div style="margin:10px;padding:10px;border:1px solid #333">
             <b>${d.symbol}</b><br>
             BUY: ${d.buy} @ ${d.buy_price} → SELL: ${d.sell} @ ${d.sell_price}<br>
-            PROFIT: <span style="color:lime;font-weight:bold">${d.profit}%</span>
+            <span style="color:lime">PROFIT: ${d.profit}%</span>
         </div>`;
     });
+
     document.getElementById("data").innerHTML = html;
 });
 </script>
+
 </body>
 </html>
 """
@@ -191,18 +224,29 @@ socket.on("update", function(data) {
 def home():
     return HTML
 
+# =============================
+# PUSH LOOP
+# =============================
 def push_loop():
     while True:
         arbs = detect_arbitrage()
+
         socketio.emit("update", {
-            "opportunities": arbs,
-            "pairs_checked": len(ORDERBOOKS)
+            "opps": arbs,
+            "pairs": len(ORDERBOOKS)
         })
+
         socketio.sleep(2)
 
+# =============================
+# START BACKGROUND TASKS
+# =============================
 socketio.start_background_task(stream_data)
 socketio.start_background_task(push_loop)
 
+# =============================
+# RUN
+# =============================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     socketio.run(app, host="0.0.0.0", port=port)

@@ -1,7 +1,12 @@
-Flask
-Flask-SocketIO
-gevent
-gevent-websocket
-ccxt
-python-socketio
-eventlet
+# Web Server & Real-time Communication
+flask==3.0.0
+flask-socketio==5.3.6
+gevent==23.9.1
+gevent-websocket==0.10.1
+
+# Exchange Connectivity
+ccxt==4.2.14
+
+# Networking & Utilities
+requests==2.31.0
+greenlet==3.0.3

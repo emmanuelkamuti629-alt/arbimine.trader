@@ -1,7 +1,7 @@
-flask
-flask-socketio
-gunicorn
+Flask
+Flask-SocketIO
 gevent
 gevent-websocket
-requests
 ccxt
+python-socketio
+eventlet

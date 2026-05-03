@@ -1,6 +1,9 @@
-
-ccxt==4.3.74
-websockets==12.0
+ccxt==4.3.57
 flask==3.0.3
-requests==2.32.3
 python-dotenv==1.0.1
+aiohttp==3.10.5
+requests==2.32.3
+websockets==13.1
+asyncio-mqtt==0.16.1
+prometheus-client==0.20.0
+gunicorn==22.0.0

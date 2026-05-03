@@ -1,12 +1,11 @@
-### Running
+# 🚀 Crypto Arb Scanner - 5 Exchanges, 200+ Pairs
 
-**Standard REST scanner**: `python app.py`
-**Low-latency WS scanner**: `python app_ws.py` - needs `ccxt.pro`
-**Docker**: `docker-compose up -d`
+Real-time cross-exchange arbitrage for MEXC/KuCoin/CoinEx/Gate/BitGet.
 
-**Before trading**: `python utils/fees.py` to update withdrawal fees
-
-### Next Steps
-1. Set up API keys in `.env` - read-only is fine for scanning
-2. Tune `config.json`: lower `min_spread` to 0.005 for more alerts
-3. For auto-execution, create new branch `feat/trader` - DO NOT run blind
+## Install (2min)
+```bash
+git clone https://github.com/YOURUSERNAME/crypto-arb-scanner
+cd crypto-arb-scanner
+pip install -r requirements.txt
+cp .env.example .env  # Add API keys
+python app.py

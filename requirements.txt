@@ -1,4 +1,6 @@
+
 ccxt==4.3.74
 websockets==12.0
 flask==3.0.3
 requests==2.32.3
+python-dotenv==1.0.1

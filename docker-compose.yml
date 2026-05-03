@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  arb-scanner:
+    build:.
+    container_name: cross-cex-scanner
+    restart: unless-stopped
+    env_file:
+      -.env
+    volumes:
+      -./config.json:/app/config.json
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

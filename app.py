@@ -1,387 +1,600 @@
+#!/usr/bin/env python3
 import os
 import asyncio
-import logging
 import threading
 import time
+import requests
+import gc
 from datetime import datetime
-from collections import defaultdict
-from flask import Flask, render_template_string, jsonify
-import ccxt.pro as ccxtpro
-from aiolimiter import AsyncLimiter
-from dotenv import load_dotenv
-
-load_dotenv()
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
 
-# === CONFIG ===
-EXCHANGE_IDS = ['mexc', 'kucoin', 'gate', 'bitget', 'coinex']
-MIN_SPREAD = 0.5 # With 280 coins, raise this to reduce noise
-MIN_TRADE_USD = 50
-MAX_TRADE_USD = 2000
-TRADE_SIZES = [50, 100, 300, 500, 1000, 2000]
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-MAX_WS_TOTAL = 500
-ORDERBOOK_DEPTH = 20
-STALE_BOOK_MS = 3000
-OPP_EXPIRE_MS = 60000 # Remove opps older than 60s
+# Add CORS headers manually instead of using flask_cors
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
 
-# === YOUR 280 COINS ===
-COINS = [
-'BTC','ETH','BNB','SOL','TON','SUI','XLM','XMR','DOGE','AVAX','TRX','ADA','MATIC','POL','LINK','DOT','XRP','ICP','HBAR','SHIB',
-'LTC','ETC','BCH','NEAR','APT','ARB','OP','INJ','RUNE','FET','GRT','UNI','AAVE','MKR','SNX','CRV','SUSHI','1INCH','COMP','YFI','BAL','GMX','WOO',
-'IMX','AR','EGLD','FLUX','ALGO','KCS','ZEC','STX','VET','FIL','RNDR','ROSE','STG','RLB','RDNT','JUP','PYR','JTO','WLD','ZRO','TIA','SEI',
-'AGIX','AKT','MINA','FLOW','ZIL','QTUM','ENJ','CHZ','BAT','MANA','SAND','GALA','AXS','ILV','YGG','DYDX','LDO','PENDLE','JOE','CELR','IOTX','CKB',
-'XVS','XEM','DGB','RVN','SC','NKN','SYS','RLC','OMG','ZRX','BAND','OXT','CTSI','PERP','RIF','LRC','SKL','CVC','WAXP','BNT','REN','UMA','NMR','TRU',
-'IDEX','HFT','BIGTIME','FLM','ALPHA','TLM','OGN','CHR','REEF','POLYX','DAR','LPT','MX','HOT','ANKR','UTK','API3','CELO','KDA','GLMR','MOVR','SXP','KAVA',
-'OKB','GT','HT','LEO','KLAY','XTZ','ATOM','KSM','WAVES','IOTA','NEO','ONT','NANO','DASH','XEC','THETA','TFUEL','FTM','CFX','STRK','METIS',
-'PEPE','BONK','WIF','POPCAT','MEW','BOME','MOG','NEIRO','BRETT','FLOKI','TURBO','WEN','SLERF','PNUT','TRUMP','MELANIA','BABYDOGE','DOGWIFHAT','TOSHI','PURR','NYAN','CAT','MASK',
-'STMX','BICO','ACH','LINA','HARD','IRIS','LTO','MDX','NULS','PHA','QNT','KNC','DODO','BEL','PERL','DATA','SFP','LIT','TORN','ARPA','GTC',
-'CTK','COS','DUSK','FIS','FORTH','FXS','MAGIC','RAD','ALICE','SLP','GMT','GST','VOXEL','XETA','HOOK','ID','ASTR','RPL','SD','LQTY','POND',
-'PEOPLE','WOJAK','MILADY','DOGS','CATE','ELON','SHIB2','PEPE2','MOON','STAR','AIDOGE','BULL','BEAR','FLOKICEO','CHEEMS','KISHU','HOGE','AKITA','SAFEMOON'
-]
+# =========================
+# CONFIGURATION
+# =========================
+MIN_PROFIT = float(os.getenv("MIN_PROFIT", "0.1"))
+MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", "1000"))
+TOP_N_COINS = 300
 
-PAIRS = list(set([f"{coin}/USDT" for coin in COINS if coin]))
-logger.info(f"Loaded {len(PAIRS)} unique USDT pairs")
-
-FEES = {
-    'mexc': {'taker': 0.002, 'maker': 0.0},
-    'kucoin': {'taker': 0.001, 'maker': 0.001},
-    'coinex': {'taker': 0.002, 'maker': 0.002},
-    'gate': {'taker': 0.0015, 'maker': 0.0015},
-    'bitget': {'taker': 0.001, 'maker': 0.001}
+EXCHANGES_TO_SCAN = {
+    'mexc': 'mexc',
+    'kucoin': 'kucoin', 
+    'coinex': 'coinex',
+    'bitmart': 'bitmart',
+    'gateio': 'gateio',
 }
 
-class ArbitrageState:
+# Global state
+latest_opportunities = []
+last_scan_time = None
+scan_count = 0
+price_table = {}
+top_300_symbols = []
+symbol_count_by_exchange = {}
+exchange_status = {}
+table_lock = threading.Lock()
+
+# Bot control flags
+bot_running = True
+poller_thread = None
+calculator_thread = None
+bot_control_lock = threading.Lock()
+
+EXCHANGE_FEES = {
+    'mexc': 0.002, 'kucoin': 0.001, 'coinex': 0.002,
+    'bitmart': 0.0025, 'gateio': 0.002,
+}
+
+# =========================
+# COMPLETE COIN LIST (300+ coins)
+# =========================
+FALLBACK_COINS = [
+    # ================= TIER 1 =================
+    'BTC','ETH','BNB','SOL','TON','SUI','XLM','XMR',
+    # ================= LARGE CAPS =================
+    'DOGE','AVAX','TRX','ADA','MATIC','POL','LINK','DOT','XRP','ICP','HBAR','SHIB',
+    'LTC','ETC','BCH','NEAR','APT','ARB','OP','INJ','RUNE','FET','GRT','UNI',
+    'AAVE','MKR','SNX','CRV','SUSHI','1INCH','COMP','YFI','BAL','GMX','WOO',
+    # ================= MID / INFRA =================
+    'IMX','AR','EGLD','FLUX','ALGO','KCS','ZEC','STX','VET','FIL','RNDR',
+    'ROSE','STG','RLB','RDNT','JUP','PYR','JTO','WLD','ZRO','TIA','SEI',
+    'AGIX','AKT','MINA','FLOW','ZIL','QTUM','ENJ','CHZ','BAT','MANA','SAND',
+    'GALA','AXS','ILV','YGG','DYDX','LDO','PENDLE','JOE','CELR','IOTX','CKB',
+    'XVS','XEM','DGB','RVN','SC','NKN','SYS','RLC','OMG','ZRX','BAND','OXT',
+    'CTSI','PERP','RIF','LRC','SKL','CVC','WAXP','BNT','REN','UMA','NMR','TRU',
+    'IDEX','HFT','BIGTIME','FLM','ALPHA','TLM','OGN','CHR','REEF','POLYX','DAR',
+    'LPT','MX','HOT','ANKR','UTK','API3','CELO','KDA','GLMR','MOVR','SXP','KAVA',
+    # ================= CEX + L1 ECOSYSTEM =================
+    'OKB','GT','HT','LEO','KLAY','XTZ','ATOM','KSM','WAVES','IOTA','NEO','ONT',
+    'NANO','DASH','XEC','THETA','TFUEL','FTM','CFX','APTOS','SUIX','STRK','METIS',
+    # ================= DEFI / AI / TREND =================
+    'PEPE','BONK','WIF','POPCAT','MEW','BOME','MOG','NEIRO','BRETT','FLOKI',
+    'TURBO','WEN','SLERF','PNUT','TRUMP','MELANIA','BABYDOGE','SHIBAINU',
+    'DOGWIFHAT','TOSHI','PURR','NYAN','CAT','MASK','GRT','FET','AGIX','RNDR',
+    # ================= ADDITIONAL MIDCAP EXPANSION =================
+    'STMX','BICO','ACH','LINA','REEF','HARD','IRIS','LTO','MDX','NULS','PHA',
+    'QNT','KNC','DODO','BEL','PERL','DATA','SFP','LIT','TORN','ARPA','GTC',
+    'CTK','COS','DUSK','FIS','FORTH','FXS','GMX','JOE','MAGIC','IMX','RAD',
+    'ALICE','SLP','GMT','GST','VOXEL','XETA','HOOK','ID','RDNT','PENDLE',
+    'ASTR','MOVR','GLMR','WOO','API3','RPL','LDO','SD','STG','LQTY','POND',
+    # ================= MEME / HIGH VOLATILITY =================
+    'PEOPLE','WOJAK','MILADY','DOGS','CATE','ELON','SHIB2','PEPE2','MOON','STAR',
+    'X','AIDOGE','BULL','BEAR','FLOKICEO','CHEEMS','KISHU','HOGE','AKITA','SAFEMOON'
+]
+
+# =========================
+# TOP 300 COIN FETCHER
+# =========================
+def get_top_300_coins():
+    global top_300_symbols
+    if top_300_symbols:
+        return top_300_symbols
+    
+    try:
+        print("🔍 Fetching top 300 coins from CoinGecko...")
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {'vs_currency': 'usd', 'order': 'volume_desc', 'per_page': 250, 'page': 1}
+        r1 = requests.get(url, params=params, timeout=20)
+        
+        coins = []
+        if isinstance(r1.json(), list):
+            coins.extend(r1.json())
+        
+        params['page'] = 2
+        r2 = requests.get(url, params=params, timeout=20)
+        if isinstance(r2.json(), list):
+            coins.extend(r2.json())
+        
+        if coins:
+            top_300_symbols = [f"{c['symbol'].upper()}/USDT" for c in coins[:TOP_N_COINS]]
+            print(f"✅ Loaded {len(top_300_symbols)} coins from CoinGecko")
+        else:
+            raise Exception("CoinGecko returned no valid data")
+            
+        return top_300_symbols
+    except Exception as e:
+        print(f"CoinGecko error: {e}. Using fallback list with {len(FALLBACK_COINS)} coins")
+        top_300_symbols = [f"{s}/USDT" for s in FALLBACK_COINS[:TOP_N_COINS]]
+        print(f"✅ Loaded {len(top_300_symbols)} coins from fallback list")
+        return top_300_symbols
+
+# =========================
+# PRICE ENGINE
+# =========================
+class PriceEngine:
     def __init__(self):
         self.exchanges = {}
-        self.orderbooks = defaultdict(lambda: defaultdict(dict))
-        self.opportunities = []
-        self.last_update = None
-        self.active_pairs = []
-        self.rate_limiters = {
-            'mexc': AsyncLimiter(18, 1), 'kucoin': AsyncLimiter(9, 1),
-            'coinex': AsyncLimiter(9, 1), 'gate': AsyncLimiter(2, 1),
-            'bitget': AsyncLimiter(9, 1),
-        }
-        self.alerted_opps = {}
-        self.ws_tasks = {}
-        self.pair_availability = defaultdict(set)
-        self.currencies = {} # {exchange: {coin: {withdraw: bool, deposit: bool}}}
+        for name, ccxt_id in EXCHANGES_TO_SCAN.items():
+            try:
+                import ccxt
+                exchange_class = getattr(ccxt, ccxt_id)
+                self.exchanges[name] = exchange_class({
+                    'enableRateLimit': True,
+                    'options': {'defaultType': 'spot'},
+                    'timeout': 30000,
+                })
+                exchange_status[name] = "init"
+            except Exception as e:
+                exchange_status[name] = f"init_failed: {str(e)[:20]}"
 
-state = ArbitrageState()
+    def get_fee(self, exchange):
+        return EXCHANGE_FEES.get(exchange, 0.002)
+
+# =========================
+# ARBITRAGE CALCULATOR
+# =========================
+class ArbitrageCalculator:
+    def __init__(self):
+        pass
+
+    def find_opportunities(self):
+        global latest_opportunities, last_scan_time, scan_count
+        start = time.time()
+        opps = []
+
+        with table_lock:
+            items = list(price_table.items())
+
+        for symbol, ex_data in items:
+            if len(ex_data) < 2:
+                continue
+
+            best_buy = None
+            best_sell = None
+            min_ask_eff = float('inf')
+            max_bid_eff = 0
+
+            for ex_name, data in ex_data.items():
+                if time.time() - data['ts'] > 90:
+                    continue
+
+                fee = EXCHANGE_FEES.get(ex_name, 0.002)
+                ask_eff = data['ask'] * (1 + fee)
+                bid_eff = data['bid'] * (1 - fee)
+
+                if ask_eff < min_ask_eff:
+                    min_ask_eff = ask_eff
+                    best_buy = (ex_name, data)
+                if bid_eff > max_bid_eff:
+                    max_bid_eff = bid_eff
+                    best_sell = (ex_name, data)
+
+            if best_buy and best_sell and best_buy[0] != best_sell[0]:
+                profit_pct = ((max_bid_eff - min_ask_eff) / min_ask_eff) * 100
+                liquidity = min(
+                    best_buy[1]['askVolume'] * best_buy[1]['ask'],
+                    best_sell[1]['bidVolume'] * best_sell[1]['bid']
+                )
+
+                if profit_pct >= MIN_PROFIT and liquidity >= MIN_LIQUIDITY:
+                    opps.append({
+                        "buy_exchange": best_buy[0].upper(),
+                        "sell_exchange": best_sell[0].upper(),
+                        "symbol": symbol.replace("/USDT", ""),
+                        "profit_percent": round(profit_pct, 3),
+                        "liquidity": int(liquidity),
+                        "buy_price": round(best_buy[1]['ask'], 6),
+                        "sell_price": round(best_sell[1]['bid'], 6),
+                        "timestamp": datetime.utcnow().strftime('%H:%M:%S')
+                    })
+
+        opps.sort(key=lambda x: x['profit_percent'], reverse=True)
+        latest_opportunities = opps[:50]
+        last_scan_time = datetime.utcnow()
+        scan_count += 1
+        print(f"Scan #{scan_count}: {len(opps)} opps from {len(items)} symbols in {time.time()-start:.2f}s")
+
+# =========================
+# BACKGROUND TASKS
+# =========================
+def fetch_exchange_sequential(name, exchange, coins):
+    global bot_running
+    try:
+        exchange.load_markets()
+        available = [s for s in coins if s in exchange.markets and exchange.markets[s].get('active', True)]
+        symbol_count_by_exchange[name] = len(available)
+        
+        if len(available) == 0:
+            exchange_status[name] = "no_pairs"
+            return name, 0
+            
+        exchange_status[name] = "ready"
+        
+        batch_size = 30
+        total_count = 0
+        for i in range(0, len(available), batch_size):
+            if not bot_running:
+                break
+            batch = available[i:i+batch_size]
+            try:
+                tickers = exchange.fetch_tickers(batch)
+                now = time.time()
+                
+                with table_lock:
+                    for symbol, ticker in tickers.items():
+                        if ticker.get('bid') and ticker.get('ask') and ticker['bid'] > 0 and ticker['ask'] > 0:
+                            if symbol not in price_table:
+                                price_table[symbol] = {}
+                            price_table[symbol][name] = {
+                                'bid': float(ticker['bid']),
+                                'ask': float(ticker['ask']),
+                                'bidVolume': float(ticker.get('quoteVolume', 0)),
+                                'askVolume': float(ticker.get('quoteVolume', 0)),
+                                'ts': now
+                            }
+                            total_count += 1
+            except Exception as e:
+                print(f"[{name}] Batch error: {e}")
+            
+            if 'tickers' in locals():
+                del tickers
+            
+            gc.collect()
+            if bot_running:
+                time.sleep(0.3)
+        
+        exchange_status[name] = f"live: {total_count}" if bot_running else "stopped"
+        return name, total_count
+    except Exception as e:
+        exchange_status[name] = "error"
+        print(f"[{name}] Fatal error: {e}")
+        return name, 0
+
+def run_rest_poller():
+    global bot_running
+    engine = PriceEngine()
+    coins = get_top_300_coins()
+    
+    while True:
+        if not bot_running:
+            time.sleep(2)
+            continue
+            
+        cycle_start = time.time()
+        print(f"\n{'='*50}")
+        print(f"🔄 Starting poll cycle at {datetime.utcnow().strftime('%H:%M:%S')}")
+        print(f"📊 Scanning {len(coins)} coins across {len(engine.exchanges)} exchanges")
+        print(f"{'='*50}")
+        
+        for name, exchange in engine.exchanges.items():
+            if not bot_running:
+                break
+            poll_start = time.time()
+            print(f"📊 Polling {name}...")
+            _, count = fetch_exchange_sequential(name, exchange, coins)
+            print(f"   ✅ {name}: {count} prices in {time.time()-poll_start:.1f}s")
+            gc.collect()
+            time.sleep(2)
+        
+        if not bot_running:
+            continue
+            
+        cycle_time = time.time() - cycle_start
+        with table_lock:
+            print(f"📈 Cycle complete: {len(price_table)} symbols tracked in {cycle_time:.1f}s")
+        
+        with table_lock:
+            now = time.time()
+            symbols_to_delete = []
+            for symbol in list(price_table.keys()):
+                exchanges_to_delete = []
+                for ex in list(price_table[symbol].keys()):
+                    if now - price_table[symbol][ex]['ts'] > 120:
+                        exchanges_to_delete.append(ex)
+                for ex in exchanges_to_delete:
+                    del price_table[symbol][ex]
+                if len(price_table[symbol]) == 0:
+                    symbols_to_delete.append(symbol)
+            for symbol in symbols_to_delete:
+                if symbol in price_table:
+                    del price_table[symbol]
+        
+        time.sleep(max(60, 180 - cycle_time))
+
+def run_calculator_loop():
+    global bot_running
+    calc = ArbitrageCalculator()
+    while True:
+        if bot_running and len(price_table) > 0:
+            try:
+                calc.find_opportunities()
+            except Exception as e:
+                print(f"Calculator error: {e}")
+        time.sleep(10)
+
+def start_bot():
+    global bot_running, poller_thread, calculator_thread
+    with bot_control_lock:
+        if not bot_running:
+            bot_running = True
+            print("🤖 Bot started by user")
+            return {"status": "success", "message": "Bot started"}
+        return {"status": "info", "message": "Bot already running"}
+
+def stop_bot():
+    global bot_running
+    with bot_control_lock:
+        if bot_running:
+            bot_running = False
+            print("🛑 Bot stopped by user")
+            return {"status": "success", "message": "Bot stopped"}
+        return {"status": "info", "message": "Bot already stopped"}
+
+# Start threads only once
+if poller_thread is None:
+    print("Starting poller thread...")
+    poller_thread = threading.Thread(target=run_rest_poller, daemon=True)
+    poller_thread.start()
+    time.sleep(30)
+
+if calculator_thread is None:
+    print("Starting calculator thread...")
+    calculator_thread = threading.Thread(target=run_calculator_loop, daemon=True)
+    calculator_thread.start()
+
+# =========================
+# FLASK ROUTES
+# =========================
+@app.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE,
+                                  opportunities=latest_opportunities,
+                                  scan_count=scan_count,
+                                  last_scan=last_scan_time.strftime('%H:%M:%S UTC') if last_scan_time else 'Starting...',
+                                  min_profit=MIN_PROFIT,
+                                  coins=len(top_300_symbols) if top_300_symbols else len(FALLBACK_COINS),
+                                  exchanges=symbol_count_by_exchange,
+                                  status=exchange_status,
+                                  bot_running=bot_running)
+
+@app.route('/api/debug')
+def debug():
+    with table_lock:
+        tracked = len(price_table)
+        symbols_with_2plus = sum(1 for s in price_table.values() if len(s) >= 2)
+    active_count = sum(1 for s in exchange_status.values() if 'live' in s)
+    return jsonify({
+        "scan_count": scan_count,
+        "total_coins": len(top_300_symbols) if top_300_symbols else len(FALLBACK_COINS),
+        "symbols_tracked": tracked,
+        "symbols_on_2plus_exchanges": symbols_with_2plus,
+        "exchange_status": exchange_status,
+        "symbols_per_exchange": symbol_count_by_exchange,
+        "active_count": f"{active_count}/5",
+        "last_scan": last_scan_time.isoformat() if last_scan_time else None,
+        "bot_running": bot_running
+    })
+
+@app.route('/api/bot/start', methods=['POST'])
+def api_start_bot():
+    return jsonify(start_bot())
+
+@app.route('/api/bot/stop', methods=['POST'])
+def api_stop_bot():
+    return jsonify(stop_bot())
+
+@app.route('/api/bot/status', methods=['GET'])
+def api_bot_status():
+    return jsonify({
+        "running": bot_running,
+        "scan_count": scan_count,
+        "last_scan": last_scan_time.isoformat() if last_scan_time else None,
+        "opportunities": len(latest_opportunities)
+    })
+
+@app.route('/api/coins', methods=['GET'])
+def api_coins():
+    """Return the list of coins being tracked"""
+    return jsonify({
+        "total": len(top_300_symbols) if top_300_symbols else len(FALLBACK_COINS),
+        "coins": [s.replace("/USDT", "") for s in (top_300_symbols if top_300_symbols else [f"{c}/USDT" for c in FALLBACK_COINS[:TOP_N_COINS]])]
+    })
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Crypto Arbitrage Scanner</title>
+    <title>Arbimine.pro - 300+ Coins</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; color: #e5e5e5; padding: 16px; }
-     .container { max-width: 800px; margin: 0 auto; }
-     .header { text-align: center; padding: 20px 0 16px; }
-     .header h1 { font-size: 1.5em; font-weight: 700; margin-bottom: 4px; background: linear-gradient(135deg, #3b82f6, #8b5cf6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-     .header p { font-size: 0.85em; color: #737373; }
-     .stats { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 16px; }
-     .stat { background: #171717; padding: 12px; border-radius: 8px; flex: 1; text-align: center; border: 1px solid #262626; }
-     .stat-val { font-size: 1.3em; font-weight: 700; color: #3b82f6; }
-     .stat-label { font-size: 0.7em; color: #737373; margin-top: 2px; }
-     .opps { display: flex; flex-direction: column; gap: 10px; }
-     .card { background: #171717; border: 1px solid #262626; border-radius: 12px; padding: 14px; display: flex; align-items: center; gap: 12px; transition: all 0.2s; }
-     .card:hover { border-color: #3b82f6; transform: translateY(-1px); }
-     .ex-box { background: #262626; padding: 8px 10px; border-radius: 8px; min-width: 90px; }
-     .ex-line { font-size: 0.75em; font-weight: 700; line-height: 1.4; }
-     .buy-text { color: #fbbf24; }
-     .sell-text { color: #fbbf24; }
-     .ex-name { color: #e5e5e5; margin-left: 4px; }
-     .pair-info { flex: 1; }
-     .pair-name { font-size: 1.1em; font-weight: 700; color: #fafafa; margin-bottom: 2px; }
-     .liquidity { font-size: 0.8em; color: #a3a3a3; }
-     .verified { font-size: 0.7em; color: #fbbf24; margin-top: 2px; }
-     .spread-box { text-align: right; }
-     .spread-val { font-size: 1.4em; font-weight: 700; color: #4ade80; }
-     .empty { text-align: center; padding: 60px 20px; color: #525252; }
-     .pulse { animation: pulse 2s infinite; }
-      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-      @media (max-width: 480px) {
-       .card { padding: 12px; gap: 8px; }
-       .ex-box { min-width: 80px; padding: 6px 8px; }
-       .pair-name { font-size: 1em; }
-       .spread-val { font-size: 1.2em; }
-      }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #0a0e27; padding: 15px; color: #ccc; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 10px; margin-bottom: 20px; color: white; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 20px; }
+        .stat-card { background: #1a1f3f; padding: 12px; border-radius: 8px; text-align: center; }
+        .stat-value { font-size: 1.5em; font-weight: bold; color: #667eea; }
+        .stat-label { font-size: 0.7em; opacity: 0.8; margin-top: 5px; }
+        .opportunities { background: #1a1f3f; border-radius: 10px; padding: 15px; overflow-x: auto; max-height: 500px; overflow-y: auto; }
+        .arb-row { display: grid; grid-template-columns: 40px 65px 65px 70px 70px 90px; gap: 8px; padding: 8px 0; border-bottom: 1px solid #2a2f4f; align-items: center; font-size: 0.8em; }
+        .arb-header { font-weight: bold; color: #667eea; border-bottom: 2px solid #667eea; margin-bottom: 8px; font-size: 0.75em; position: sticky; top: 0; background: #1a1f3f; }
+        .buy { color: #10b981; font-weight: bold; }
+        .sell { color: #f59e0b; font-weight: bold; }
+        .profit { color: #10b981; font-weight: bold; }
+        .exchange { background: #2a2f4f; padding: 3px 5px; border-radius: 4px; font-size: 0.7em; display: inline-block; }
+        .live-indicator { display: inline-block; width: 10px; height: 10px; background: #10b981; border-radius: 50%; animation: pulse 1s infinite; margin-left: 8px; }
+        .stopped-indicator { display: inline-block; width: 10px; height: 10px; background: #ef4444; border-radius: 50%; margin-left: 8px; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        footer { text-align: center; margin-top: 20px; color: #666; font-size: 0.7em; }
+        .debug { background: #2a2f4f; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 0.65em; font-family: monospace; word-break: break-all; max-height: 80px; overflow-y: auto; }
+        .no-opps { text-align: center; padding: 40px; color: #888; }
+        .control-panel { background: #1a1f3f; padding: 15px; border-radius: 10px; margin-bottom: 20px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+        .btn { padding: 10px 20px; border: none; border-radius: 5px; font-size: 14px; font-weight: bold; cursor: pointer; transition: all 0.3s; }
+        .btn-start { background: #10b981; color: white; }
+        .btn-start:hover { background: #059669; }
+        .btn-stop { background: #ef4444; color: white; }
+        .btn-stop:hover { background: #dc2626; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .status-badge { padding: 5px 15px; border-radius: 20px; font-size: 12px; font-weight: bold; }
+        .status-running { background: #10b981; color: white; }
+        .status-stopped { background: #ef4444; color: white; }
+        .status-text { margin-left: 10px; font-size: 14px; font-weight: bold; }
+        .btn-refresh { background: #667eea; color: white; }
+        .btn-refresh:hover { background: #5b67d6; }
+        .coin-count { background: #2a2f4f; padding: 5px 10px; border-radius: 20px; font-size: 12px; }
     </style>
-    <script>
-        function timeAgo(ts) {
-            const sec = Math.floor((Date.now() - ts) / 1000);
-            if (sec < 60) return sec + ' seconds ago';
-            return Math.floor(sec / 60) + ' minutes ago';
-        }
-
-        async function refresh() {
-            try {
-                const res = await fetch('/api/opportunities');
-                const data = await res.json();
-                document.getElementById('oppCount').textContent = data.opportunities.length;
-                document.getElementById('bestSpread').textContent = data.best_spread || '0%';
-                document.getElementById('pairsCount').textContent = data.pairs_monitored;
-
-                const container = document.getElementById('opps');
-                if (!data.opportunities.length) {
-                    container.innerHTML = '<div class="empty pulse">Scanning ' + data.pairs_monitored + ' pairs across ' + data.exchanges + ' exchanges...</div>';
-                    return;
-                }
-
-                container.innerHTML = data.opportunities.map(o => `
-                    <div class="card">
-                        <div class="ex-box">
-                            <div class="ex-line"><span class="buy-text">BUY</span><span class="ex-name">${o.buy_ex.toUpperCase()}</span></div>
-                            <div class="ex-line"><span class="sell-text">SELL</span><span class="ex-name">${o.sell_ex.toUpperCase()}</span></div>
-                        </div>
-                        <div class="pair-info">
-                            <div class="pair-name">${o.pair}</div>
-                            <div class="liquidity">Liquidity: $${o.liquidity.toLocaleString()}</div>
-                            <div class="verified">Last Verified ${timeAgo(o.ts)}</div>
-                        </div>
-                        <div class="spread-box">
-                            <div class="spread-val">${o.spread}%</div>
-                        </div>
-                    </div>
-                `).join('');
-            } catch(e) { console.error(e); }
-        }
-        setInterval(refresh, 1000);
-        refresh();
-    </script>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>Arbitrage Scanner</h1>
-            <p>Real-time spot opportunities across ${len(EXCHANGE_IDS)} exchanges</p>
+            <h1>🚀 Arbimine.pro <span id="statusIndicator" class="{% if bot_running %}live-indicator{% else %}stopped-indicator{% endif %}"></span></h1>
+            <p>5 Exchanges | <span id="coinCount">{{ coins }}</span>+ Coins | Real-time Arbitrage Scanner</p>
         </div>
+
+        <div class="control-panel">
+            <button class="btn btn-start" id="startBtn" {% if bot_running %}disabled{% endif %}>▶ START BOT</button>
+            <button class="btn btn-stop" id="stopBtn" {% if not bot_running %}disabled{% endif %}>⏹ STOP BOT</button>
+            <button class="btn btn-refresh" id="refreshBtn">🔄 Refresh Status</button>
+            <div class="status-text">
+                Bot Status: <span id="botStatus" class="status-badge {% if bot_running %}status-running{% else %}status-stopped{% endif %}">
+                    {% if bot_running %}RUNNING{% else %}STOPPED{% endif %}
+                </span>
+            </div>
+            <div class="coin-count">📊 Tracking {{ coins }} coins</div>
+        </div>
+
         <div class="stats">
-            <div class="stat"><div class="stat-val" id="oppCount">0</div><div class="stat-label">Opportunities</div></div>
-            <div class="stat"><div class="stat-val" id="bestSpread">0%</div><div class="stat-label">Best Spread</div></div>
-            <div class="stat"><div class="stat-val" id="pairsCount">0</div><div class="stat-label">Pairs Live</div></div>
+            <div class="stat-card"><div class="stat-value">{{ opportunities|length }}</div><div class="stat-label">Opportunities</div></div>
+            <div class="stat-card"><div class="stat-value">{{ coins }}</div><div class="stat-label">Coins Tracked</div></div>
+            <div class="stat-card"><div class="stat-value">{{ exchanges|length }}</div><div class="stat-label">Active Exchanges</div></div>
+            <div class="stat-card"><div class="stat-value">{{ scan_count }}</div><div class="stat-label">Total Scans</div></div>
+            <div class="stat-card"><div class="stat-value">{{ last_scan }}</div><div class="stat-label">Last Update</div></div>
+            <div class="stat-card"><div class="stat-value">{{ min_profit }}%</div><div class="stat-label">Min Profit</div></div>
         </div>
-        <div class="opps" id="opps">
-            <div class="empty pulse">Initializing...</div>
+
+        <div class="debug">
+            <strong>🔌 Exchange Status:</strong> {% for ex, stat in status.items() %}{{ ex }}:{{ stat }} | {% endfor %}
         </div>
+
+        <div class="opportunities">
+            <div class="arb-row arb-header">
+                <div>Action</div><div>Buy From</div><div>Sell To</div><div>Coin</div><div>Profit</div><div>Liquidity</div>
+            </div>
+            {% if opportunities %}
+                {% for opp in opportunities %}
+                <div class="arb-row">
+                    <div class="buy">BUY</div>
+                    <div><span class="exchange">{{ opp.buy_exchange }}</span></div>
+                    <div><span class="exchange">{{ opp.sell_exchange }}</span></div>
+                    <div><strong>{{ opp.symbol }}</strong></div>
+                    <div class="profit">{{ opp.profit_percent }}%</div>
+                    <div>${{ "{:,}".format(opp.liquidity) }}</div>
+                </div>
+                {% endfor %}
+            {% else %}
+                <div class="no-opps">
+                    🔍 Scanning {{ coins }} coins across 5 exchanges...<br>
+                    Full cycle takes ~3-4 minutes. Check <a href="/api/debug" style="color:#667eea">/api/debug</a> for details.
+                </div>
+            {% endif %}
+        </div>
+
+        <footer>
+            Active pairs: {% for ex, count in exchanges.items() if count > 0 %}{{ ex|upper }}:{{ count }} {% endfor %}
+            <br>Auto-refreshes every 20 seconds | Total fallback coins: 300+
+        </footer>
     </div>
+
+    <script>
+        function updateBotStatus() {
+            fetch('/api/bot/status')
+                .then(response => response.json())
+                .then(data => {
+                    const statusSpan = document.getElementById('botStatus');
+                    const indicator = document.getElementById('statusIndicator');
+                    const startBtn = document.getElementById('startBtn');
+                    const stopBtn = document.getElementById('stopBtn');
+                    
+                    if (data.running) {
+                        statusSpan.textContent = 'RUNNING';
+                        statusSpan.className = 'status-badge status-running';
+                        indicator.className = 'live-indicator';
+                        startBtn.disabled = true;
+                        stopBtn.disabled = false;
+                    } else {
+                        statusSpan.textContent = 'STOPPED';
+                        statusSpan.className = 'status-badge status-stopped';
+                        indicator.className = 'stopped-indicator';
+                        startBtn.disabled = false;
+                        stopBtn.disabled = true;
+                    }
+                })
+                .catch(error => console.error('Error:', error));
+        }
+
+        function startBot() {
+            fetch('/api/bot/start', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    console.log(data.message);
+                    updateBotStatus();
+                    setTimeout(() => location.reload(), 1000);
+                })
+                .catch(error => console.error('Error:', error));
+        }
+
+        function stopBot() {
+            fetch('/api/bot/stop', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    console.log(data.message);
+                    updateBotStatus();
+                    setTimeout(() => location.reload(), 1000);
+                })
+                .catch(error => console.error('Error:', error));
+        }
+
+        document.getElementById('startBtn').addEventListener('click', startBot);
+        document.getElementById('stopBtn').addEventListener('click', stopBot);
+        document.getElementById('refreshBtn').addEventListener('click', updateBotStatus);
+        
+        setInterval(() => location.reload(), 20000);
+        setInterval(updateBotStatus, 5000);
+    </script>
 </body>
 </html>
 """
 
-async def init_exchanges():
-    for ex_id in EXCHANGE_IDS:
-        try:
-            ex_class = getattr(ccxtpro, ex_id)
-            state.exchanges[ex_id] = ex_class({'enableRateLimit': True, 'options': {'defaultType': 'spot'}, 'timeout': 30000})
-            await state.exchanges[ex_id].load_markets()
-            logger.info(f"Loaded {ex_id}: {len(state.exchanges[ex_id].markets)} markets")
-        except Exception as e:
-            logger.error(f"Failed {ex_id}: {e}")
-
-async def load_currencies():
-    """Load deposit/withdrawal status to filter fake arbs"""
-    for ex_id, ex in state.exchanges.items():
-        try:
-            async with state.rate_limiters[ex_id]:
-                state.currencies[ex_id] = await ex.fetch_currencies()
-            logger.info(f"Loaded currency status for {ex_id}")
-        except Exception as e:
-            logger.warning(f"Could not load currencies for {ex_id}: {e}")
-
-async def filter_active_pairs():
-    for pair in PAIRS:
-        for ex_id, ex in state.exchanges.items():
-            if pair in ex.markets and ex.markets.get('active', True):
-                state.pair_availability.add(ex_id)
-
-    pair_scores = [(p, len(exs)) for p, exs in state.pair_availability.items()]
-    pair_scores.sort(key=lambda x: x[1], reverse=True)
-    state.active_pairs = [p[0] for p in pair_scores if p[1] >= 2]
-    logger.info(f"Monitoring {len(state.active_pairs)} pairs on 2+ exchanges")
-    return state.active_pairs
-
-def calc_fill_price(book_side, amount_usd):
-    remaining = amount_usd
-    total_base = 0
-    total_cost = 0
-    for price, qty in book_side:
-        level_usd = price * qty
-        if remaining >= level_usd:
-            total_base += qty
-            total_cost += level_usd
-            remaining -= level_usd
-        else:
-            partial_qty = remaining / price
-            total_base += partial_qty
-            total_cost += remaining
-            remaining = 0
-            break
-    if total_base == 0:
-        return 0, 0, True
-    return total_cost / total_base, total_base, remaining > 1
-
-def check_deposits_ok(exchange, coin):
-    """Check if deposits/withdrawals enabled. Returns False if disabled"""
-    if exchange not in state.currencies:
-        return True # Can't check, assume OK
-    coin_data = state.currencies[exchange].get(coin)
-    if not coin_data:
-        return True
-    return coin_data.get('active', True) and coin_data.get('withdraw', True) and coin_data.get('deposit', True)
-
-async def check_arbitrage(pair):
-    if len(state.orderbooks) < 2:
-        return
-    now = int(time.time() * 1000)
-    base = pair.split('/')[0]
-
-    for trade_usd in TRADE_SIZES:
-        for buy_ex, buy_ob in state.orderbooks.items():
-            if not check_deposits_ok(buy_ex, base):
-                continue
-            for sell_ex, sell_ob in state.orderbooks.items():
-                if buy_ex == sell_ex or not check_deposits_ok(sell_ex, base):
-                    continue
-                if now - buy_ob['ts'] > STALE_BOOK_MS or now - sell_ob['ts'] > STALE_BOOK_MS:
-                    continue
-
-                buy_price, buy_qty, buy_partial = calc_fill_price(buy_ob['asks'], trade_usd)
-                if buy_partial or buy_qty == 0:
-                    continue
-                sell_price, sell_qty, sell_partial = calc_fill_price(sell_ob['bids'], buy_qty * sell_price)
-                if sell_partial or sell_qty < buy_qty * 0.97:
-                    continue
-
-                buy_fee = FEES[buy_ex]['taker']
-                sell_fee = FEES[sell_ex]['taker']
-                buy_cost = buy_qty * buy_price * (1 + buy_fee)
-                sell_rev = buy_qty * sell_price * (1 - sell_fee)
-                profit = sell_rev - buy_cost
-                spread = profit / trade_usd * 100
-
-                if spread >= MIN_SPREAD:
-                    # Calculate available liquidity at best bid/ask
-                    liquidity = min(buy_ob['asks'][0][0] * buy_ob['asks'][0][1],
-                                   sell_ob['bids'][0][0] * sell_ob['bids'][0][1])
-                    opp = {
-                        'pair': pair, 'buy_ex': buy_ex, 'sell_ex': sell_ex,
-                        'buy_price': f"{buy_price:.8f}".rstrip('0').rstrip('.'),
-                        'sell_price': f"{sell_price:.8f}".rstrip('0').rstrip('.'),
-                        'spread': round(spread, 1), 'profit': round(profit, 2),
-                        'size_usd': trade_usd, 'liquidity': int(liquidity), 'ts': now
-                    }
-                    await handle_opportunity(opp)
-                    return
-
-async def handle_opportunity(opp):
-    state.opportunities = [o for o in state.opportunities if time.time() * 1000 - o['ts'] < OPP_EXPIRE_MS]
-    existing = next((o for o in state.opportunities if o['pair'] == opp['pair']), None)
-    if existing and existing['spread'] >= opp['spread']:
-        return
-    if existing:
-        state.opportunities.remove(existing)
-    state.opportunities.append(opp)
-    state.opportunities.sort(key=lambda x: x['spread'], reverse=True)
-    state.opportunities = state.opportunities[:100]
-    state.last_update = datetime.now()
-
-    opp_key = f"{opp['pair']}_{opp['buy_ex']}_{opp['sell_ex']}"
-    if TELEGRAM_TOKEN and time.time() - state.alerted_opps.get(opp_key, 0) > 600:
-        state.alerted_opps[opp_key] = time.time()
-        asyncio.create_task(send_telegram(opp))
-
-async def send_telegram(opp):
-    try:
-        import aiohttp
-        msg = (f"🚨 {opp['pair']} {opp['spread']}%\n"
-               f"BUY {opp['buy_ex'].upper()} ${opp['buy_price']}\n"
-               f"SELL {opp['sell_ex'].upper()} ${opp['sell_price']}\n"
-               f"${opp['size_usd']} | Liq: ${opp['liquidity']} | +${opp['profit']}")
-        async with aiohttp.ClientSession() as s:
-            await s.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                        json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
-    except: pass
-
-async def watch_orderbook(exchange, pair):
-    task_key = f"{exchange.id}_{pair}"
-    while True:
-        try:
-            ob = await exchange.watch_order_book(pair, limit=ORDERBOOK_DEPTH)
-            if ob['bids'] and ob['asks']:
-                state.orderbooks[exchange.id] = {
-                    'bids': ob['bids'][:ORDERBOOK_DEPTH],
-                    'asks': ob['asks'][:ORDERBOOK_DEPTH],
-                    'ts': exchange.milliseconds()
-                }
-                await check_arbitrage(pair)
-        except Exception as e:
-            logger.debug(f"WS {task_key}: {e}")
-            await exchange.sleep(5000)
-
-async def scanner_loop():
-    await init_exchanges()
-    await load_currencies()
-    pairs = await filter_active_pairs()
-
-    ws_count = 0
-    for pair in pairs:
-        for ex_id in state.pair_availability:
-            if ws_count >= MAX_WS_TOTAL:
-                logger.warning(f"Hit MAX_WS_TOTAL={MAX_WS_TOTAL}. Monitoring {ws_count} streams")
-                break
-            if ex_id not in state.exchanges:
-                continue
-            ex = state.exchanges[ex_id]
-            task_key = f"{ex_id}_{pair}"
-            state.ws_tasks[task_key] = asyncio.create_task(watch_orderbook(ex, pair))
-            ws_count += 1
-        if ws_count >= MAX_WS_TOTAL:
-            break
-
-    logger.info(f"Started {ws_count} WebSocket streams")
-    await asyncio.gather(*state.ws_tasks.values(), return_exceptions=True)
-
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE, PAIRS=PAIRS, MIN_TRADE_USD=MIN_TRADE_USD,
-                                 MAX_TRADE_USD=MAX_TRADE_USD, MIN_SPREAD=MIN_SPREAD)
-
-@app.route('/api/opportunities')
-def api_opps():
-    now = time.time() * 1000
-    for o in state.opportunities:
-        o['age'] = int((now - o['ts']) / 1000)
-    return jsonify({
-        'opportunities': state.opportunities,
-        'best_spread': f"{state.opportunities[0]['spread']}%" if state.opportunities else "0%",
-        'pairs_monitored': len(state.active_pairs),
-        'ws_connections': len(state.ws_tasks),
-        'exchanges': len(EXCHANGE_IDS),
-        'last_update': state.last_update.strftime('%H:%M:%S') if state.last_update else None
-    })
-
-@app.route('/health')
-def health():
-    return {
-        'status': 'ok', 'pairs_total': len(PAIRS), 'pairs_active': len(state.active_pairs),
-        'opps': len(state.opportunities), 'ws': len(state.ws_tasks)
-    }
-
-def run_scanner():
-    asyncio.run(scanner_loop())
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    threading.Thread(target=run_scanner, daemon=True).start()
-    logger.info(f"🚀 Scanner: {len(PAIRS)} coins, {len(EXCHANGE_IDS)} exchanges")
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    print("="*70)
+    print("🚀 Arbimine.pro - Enhanced Arbitrage Scanner with 300+ Coins")
+    print("="*70)
+    print(f"📊 Exchanges: {', '.join(EXCHANGES_TO_SCAN.keys())}")
+    print(f"⚡ Config: {TOP_N_COINS} coins | Min Profit: {MIN_PROFIT}% | Min Liquidity: ${MIN_LIQUIDITY}")
+    print(f"📈 Total coins in fallback list: {len(FALLBACK_COINS)}")
+    print(f"🌐 Dashboard: http://localhost:{port}")
+    print(f"🔍 Debug: http://localhost:{port}/api/debug")
+    print(f"🎮 Bot Control: Use buttons on dashboard to start/stop the scanner")
+    print("="*70)
+    app.run(host="0.0.0.0", port=port, threaded=True, debug=False, use_reloader=False)

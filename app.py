@@ -1,252 +1,122 @@
-from gevent import monkey
-monkey.patch_all()
-
-import time
+import asyncio
+import json
 import os
-import logging
-from flask import Flask
-from flask_socketio import SocketIO
-import ccxt
-from concurrent.futures import ThreadPoolExecutor
+import ccxt.async_support as ccxt
+from dotenv import load_dotenv
+from datetime import datetime
 
-# =============================
-# SETUP
-# =============================
-logging.basicConfig(level=logging.INFO)
+load_dotenv()
 
-app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
+class ArbitrageScanner:
+    def __init__(self):
+        self.exchanges = {}
+        self.config = self.load_config()
+        self.symbols = [f"{coin}/USDT" for coin in self.config['coins']]
+        self.min_spread = self.config['min_spread']
+        self.telegram_token = os.getenv('TELEGRAM_TOKEN')
+        self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
 
-executor = ThreadPoolExecutor(max_workers=20)
+    def load_config(self):
+        with open('config.json', 'r') as f:
+            return json.load(f)
 
-# =============================
-# EXCHANGES
-# =============================
-exchanges = {
-    "mexc": ccxt.mexc({"enableRateLimit": True}),
-    "kucoin": ccxt.kucoin({"enableRateLimit": True}),
-    "gateio": ccxt.gateio({"enableRateLimit": True}),
-    "coinex": ccxt.coinex({"enableRateLimit": True})
-}
-
-for name, ex in exchanges.items():
-    try:
-        ex.load_markets()
-        logging.info(f"{name} markets loaded: {len(ex.markets)}")
-    except Exception as e:
-        logging.error(f"{name} failed: {e}")
-
-# =============================
-# BUILD COMMON SYMBOL LIST (IMPORTANT FIX)
-# =============================
-common_symbols = set(exchanges["mexc"].markets)
-
-for ex in exchanges.values():
-    common_symbols &= set(ex.markets)
-
-symbols = list(common_symbols)
-
-logging.info(f"Common symbols found: {len(symbols)}")
-
-# fallback if too small
-if len(symbols) < 10:
-    symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
-
-# =============================
-# CONFIG
-# =============================
-ORDERBOOKS = {}
-MIN_PROFIT = 0.01   # lowered for detection
-MAX_AGE = 10
-
-FEES = {
-    "mexc": 0.001,
-    "kucoin": 0.001,
-    "gateio": 0.002,
-    "coinex": 0.002
-}
-
-# =============================
-# ORDERBOOK STORAGE
-# =============================
-def update_orderbook(exchange, symbol, bid, ask, bid_vol, ask_vol):
-    ORDERBOOKS[f"{exchange}:{symbol}"] = {
-        "bid": bid,
-        "ask": ask,
-        "bid_vol": bid_vol,
-        "ask_vol": ask_vol,
-        "time": time.time()
-    }
-
-# =============================
-# FETCH DATA (THREAD SAFE)
-# =============================
-def fetch_orderbook(ex_name, ex, sym):
-    try:
-        if sym not in ex.markets:
-            return
-
-        ob = ex.fetch_order_book(sym, limit=5)
-        bids = ob.get("bids")
-        asks = ob.get("asks")
-
-        if bids and asks and bids[0] and asks[0]:
-            update_orderbook(
-                ex_name,
-                sym,
-                bids[0][0],
-                asks[0][0],
-                bids[0][1],
-                asks[0][1]
-            )
-
-    except Exception as e:
-        logging.warning(f"{ex_name} {sym}: {e}")
-
-# =============================
-# STREAM LOOP
-# =============================
-def stream_data():
-    while True:
-        tasks = []
-
-        for ex_name, ex in exchanges.items():
-            for sym in symbols:
-                tasks.append(executor.submit(fetch_orderbook, ex_name, ex, sym))
-
-        # allow tasks to complete
-        for t in tasks:
+    async def init_exchanges(self):
+        exchange_list = ['mexc', 'kucoin', 'gateio', 'coinex', 'bitget']
+        for ex_id in exchange_list:
             try:
-                t.result(timeout=5)
-            except:
-                pass
+                exchange_class = getattr(ccxt, ex_id)
+                self.exchanges[ex_id] = exchange_class({
+                    'apiKey': os.getenv(f'{ex_id.upper()}_API_KEY', ''),
+                    'secret': os.getenv(f'{ex_id.upper()}_SECRET', ''),
+                    'enableRateLimit': True,
+                    'options': {'defaultType': 'spot'}
+                })
+                await self.exchanges[ex_id].load_markets()
+                print(f"[+] {ex_id} connected")
+            except Exception as e:
+                print(f"[-] {ex_id} failed: {e}")
 
-        socketio.sleep(1)
-
-# =============================
-# ARBITRAGE DETECTOR
-# =============================
-def detect_arbitrage():
-    now = time.time()
-    grouped = []
-    results = []
-
-    data = {}
-
-    for k, v in ORDERBOOKS.items():
-        if now - v["time"] > MAX_AGE:
-            continue
+    async def fetch_ticker(self, exchange, ex_id, symbol):
         try:
-            ex, sym = k.split(":", 1)
-            data.setdefault(sym, {})[ex] = v
+            ticker = await exchange.fetch_ticker(symbol)
+            return ex_id, symbol, ticker['bid'], ticker['ask'], ticker['quoteVolume']
         except:
-            continue
+            return ex_id, symbol, None, None, None
 
-    for sym, ex_data in data.items():
-        ex_list = list(ex_data.keys())
+    async def scan_once(self):
+        tasks = []
+        for ex_id, exchange in self.exchanges.items():
+            for symbol in self.symbols:
+                if symbol in exchange.markets:
+                    tasks.append(self.fetch_ticker(exchange, ex_id, symbol))
 
-        for buy_ex in ex_list:
-            for sell_ex in ex_list:
-                if buy_ex == sell_ex:
-                    continue
+        results = await asyncio.gather(*tasks)
 
-                buy = ex_data[buy_ex]["ask"]
-                sell = ex_data[sell_ex]["bid"]
+        # Organize by symbol
+        data = {}
+        for ex_id, symbol, bid, ask, vol in results:
+            if bid is None or vol < self.config['min_volume_usd']: continue
+            if symbol not in data: data[symbol] = {}
+            data[symbol][ex_id] = {'bid': bid, 'ask': ask}
 
-                if not buy or not sell:
-                    continue
+        # Find opportunities
+        opps = []
+        for symbol, ex_data in data.items():
+            for buy_ex, buy in ex_data.items():
+                for sell_ex, sell in ex_data.items():
+                    if buy_ex == sell_ex: continue
 
-                fee = (FEES.get(buy_ex, 0) + FEES.get(sell_ex, 0)) * 100
-                profit = ((sell - buy) / buy) * 100 - fee
+                    buy_price = buy['ask']
+                    sell_price = sell['bid']
+                    fee = self.config['fees'].get(buy_ex, 0.001) + self.config['fees'].get(sell_ex, 0.001) + 0.002
 
-                buy_liq = buy * ex_data[buy_ex]["ask_vol"]
-                sell_liq = sell * ex_data[sell_ex]["bid_vol"]
+                    spread = (sell_price - buy_price) / buy_price - fee
+                    if spread > self.min_spread:
+                        opps.append({
+                            'symbol': symbol,
+                            'buy_ex': buy_ex, 'buy_price': buy_price,
+                            'sell_ex': sell_ex, 'sell_price': sell_price,
+                            'spread': spread,
+                            'time': datetime.now().strftime('%H:%M:%S')
+                        })
+        return opps
 
-                if profit > MIN_PROFIT and buy_liq > 100 and sell_liq > 100:
-                    results.append({
-                        "symbol": sym,
-                        "buy": buy_ex,
-                        "sell": sell_ex,
-                        "profit": round(profit, 4),
-                        "buy_price": buy,
-                        "sell_price": sell
-                    })
+    async def send_telegram(self, msg):
+        if not self.telegram_token: return
+        import aiohttp
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        async with aiohttp.ClientSession() as session:
+            await session.post(url, json={'chat_id': self.telegram_chat_id, 'text': msg, 'parse_mode': 'Markdown'})
 
-    return sorted(results, key=lambda x: x["profit"], reverse=True)
+    async def run(self):
+        await self.init_exchanges()
+        print(f"\n[SCANNER STARTED] {len(self.symbols)} pairs | Min spread: {self.min_spread*100:.1f}%\n")
 
-# =============================
-# FRONTEND
-# =============================
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>Arbitrage Scanner</title>
-<script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
-</head>
-<body style="background:#0f0f0f;color:white;font-family:Arial;padding:20px">
+        while True:
+            try:
+                opportunities = await self.scan_once()
+                for opp in opportunities:
+                    msg = f"*ARB FOUND* `{opp['time']}`\n" \
+                          f"`{opp['symbol']}`\n" \
+                          f"Buy *{opp['buy_ex']}* @ `${opp['buy_price']:.6f}`\n" \
+                          f"Sell *{opp['sell_ex']}* @ `${opp['sell_price']:.6f}`\n" \
+                          f"Net Spread: *{opp['spread']*100:.2f}%*"
+                    print(msg.replace('*','').replace('`',''))
+                    await self.send_telegram(msg)
 
-<h2>🔥 Live Arbitrage Scanner</h2>
-<div id="status">Loading...</div>
-<div id="data"></div>
+                await asyncio.sleep(self.config['scan_interval'])
+            except Exception as e:
+                print(f"Error: {e}")
+                await asyncio.sleep(10)
 
-<script>
-const socket = io();
+    async def close(self):
+        for exchange in self.exchanges.values():
+            await exchange.close()
 
-socket.on("update", function(data) {
-    document.getElementById("status").innerHTML =
-        `Pairs: ${data.pairs} | Opportunities: ${data.opps.length}`;
-
-    let html = "";
-
-    if (data.opps.length === 0) {
-        html = "<p>No opportunities right now</p>";
-    }
-
-    data.opps.forEach(d => {
-        html += `
-        <div style="margin:10px;padding:10px;border:1px solid #333">
-            <b>${d.symbol}</b><br>
-            BUY: ${d.buy} @ ${d.buy_price} → SELL: ${d.sell} @ ${d.sell_price}<br>
-            <span style="color:lime">PROFIT: ${d.profit}%</span>
-        </div>`;
-    });
-
-    document.getElementById("data").innerHTML = html;
-});
-</script>
-
-</body>
-</html>
-"""
-
-@app.route("/")
-def home():
-    return HTML
-
-# =============================
-# PUSH LOOP
-# =============================
-def push_loop():
-    while True:
-        arbs = detect_arbitrage()
-
-        socketio.emit("update", {
-            "opps": arbs,
-            "pairs": len(ORDERBOOKS)
-        })
-
-        socketio.sleep(2)
-
-# =============================
-# START BACKGROUND TASKS
-# =============================
-socketio.start_background_task(stream_data)
-socketio.start_background_task(push_loop)
-
-# =============================
-# RUN
-# =============================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    socketio.run(app, host="0.0.0.0", port=port)
+    scanner = ArbitrageScanner()
+    try:
+        asyncio.run(scanner.run())
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        asyncio.run(scanner.close())

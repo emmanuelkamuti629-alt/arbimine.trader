@@ -1,0 +1,43 @@
+{
+  "coins": [
+    "BTC", "ETH", "XRP", "XLM", "TRX", "DOGE", "LTC", "SOL", "ADA", "BNB",
+    "LINK", "DOT", "AVAX", "MATIC", "TON", "ATOM", "ETC", "BCH", "FIL", "UNI",
+    "AAVE", "NEAR", "ALGO", "ICP", "VET", "EOS", "SAND", "MANA", "AXS", "GRT",
+    "EGLD", "XTZ", "THETA", "KAVA", "HBAR", "FLOW", "FTM", "OP", "ARB", "APT",
+    "SUI", "SEI", "INJ", "RUNE", "FET", "RNDR", "IMX", "STX", "MKR", "LDO",
+    "CRV", "SNX", "COMP", "ZEC", "DASH", "ZIL", "CHZ", "ENJ", "BAT", "ONE",
+    "CELO", "IOTA", "QTUM", "NEO", "ROSE", "KSM", "MINA", "OCEAN", "BLUR", "DYDX",
+    "GMX", "YFI", "SUSHI", "CAKE", "KNC", "CFX", "JST", "TWT", "FLUX", "HOT",
+    "RVN", "SC", "ICX", "WOO", "ZRX", "COTI", "AUDIO", "ANKR", "API3", "MASK",
+    "ONT", "BICO", "LRC", "CELR", "SKL", "HNT", "OSMO", "JASMY", "ARKM", "BONK",
+    "PEPE", "FLOKI", "WIF", "PYTH", "JTO", "TIA", "STRK", "ALT", "ACE", "PORTAL",
+    "XAI", "NTRN", "AKT", "CSPR", "SFP", "DGB", "NKN", "REQ", "STORJ", "BAND",
+    "UMA", "BAL", "CVC", "SXP", "CTSI", "ACH", "DUSK", "TOMO", "XNO", "KDA",
+    "LPT", "WAXP", "GLMR", "METIS", "ASTR", "MAGIC", "EDU", "PENDLE", "GAL", "AGIX",
+    "OXT", "ILV", "TRB", "NMR", "BNT", "RLC", "POLYX", "PROM", "ORDI", "SATS",
+    "MEME", "TURBO", "PEOPLE", "SSV", "ETHW", "ZETA", "MAV", "ARPA", "CTXC", "TLM",
+    "C98", "DAR", "DEGO", "MDT", "LINA", "RSR", "HIFI", "FIDA", "HFT", "ATA",
+    "YGG", "ALICE", "RARE", "SUPER", "BOME", "MBL", "WIN", "BTT", "CEEK", "SNT",
+    "KLAY", "ONG", "XVG", "DENT", "ARDR", "SYS", "STRAX", "DIA", "DODO", "WLD",
+    "OM", "AEVO", "PIXEL", "ETHFI", "GALA", "SLP", "AERGO", "POWR", "CKB", "BSW",
+    "HOOK", "ID", "BADGER", "BEL", "FORTH", "QUICK", "RAD", "KEY", "BETA", "TKO",
+    "PERP", "FIS", "BAKE", "FRONT", "ALPHA", "REN", "PHA", "NULS", "UOS", "GHST",
+    "LOOM", "XVS", "HARD", "SUN", "WRX", "LIT", "RIF", "MBOX", "COS", "CTC",
+    "VOXEL", "OGN", "OMNI", "TNSR", "MANTA", "ONDO", "JUP", "RAY", "GMT", "ACS",
+    "MOBILE", "HONEY", "PRIME", "CFG", "CANTO", "SAGA", "DYM", "W", "IO", "ZK",
+    "REZ", "LISTA", "NOT", "CATI", "HMSTR", "BANANA", "MYRO", "POPCAT", "MEW",
+    "BRETT", "MOG", "TOSHI", "TOKENFI", "OAS", "CORE", "TAO", "NFP", "VANRY", "XEC",
+    "DCR", "KAS", "RON", "SHRAP", "VRA", "TRIAS", "VIDT", "PIVX", "CUDOS", "XCH",
+    "UXLINK", "BONE", "GAS", "BORA", "XPR", "TEL", "EVER"
+  ],
+  "min_spread": 0.008,
+  "min_volume_usd": 50000,
+  "scan_interval": 8,
+  "fees": {
+    "mexc": 0.001,
+    "kucoin": 0.001,
+    "gateio": 0.002,
+    "coinex": 0.002,
+    "bitget": 0.001
+  }
+}

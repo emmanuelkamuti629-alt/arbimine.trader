@@ -14,7 +14,7 @@ app = Flask(__name__)
 # ================= CONFIG =================
 EXCHANGE_IDS = ['mexc', 'kucoin', 'coinex', 'gate', 'bitget']
 MIN_SPREAD = 0.3
-MIN_VOLUME_USD = 5000
+MIN_VOLUME_USD =300
 REFRESH_SECONDS = 3
 
 FEES = {

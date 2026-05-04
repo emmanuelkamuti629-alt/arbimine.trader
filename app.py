@@ -55,11 +55,9 @@ WITHDRAWAL_FEES = {
 DEFAULT_NETWORK = 'ERC20'
 MIN_PROFIT_PERCENT = 0.4
 MIN_LIQUIDITY_USD = 100
+BATCH_SIZE = 10
 
-# Continuous scanning - NO intervals, just continuous loop
-BATCH_SIZE = 10  # Scan 10 symbols at a time
-CONTINUOUS_MODE = True  # Never stop scanning
-
+# Initialize exchanges
 exchanges = {}
 for name, keys in API_KEYS.items():
     if keys['apiKey'] and keys['secret']:
@@ -68,14 +66,14 @@ for name, keys in API_KEYS.items():
             print(f"✓ Initialized {name}")
         except Exception as e:
             print(f"✗ Failed to initialize {name}: {e}")
+    else:
+        print(f"✗ {name}: No API keys found in environment variables")
 
 app = FastAPI()
 latest_opportunities = []
 all_known_symbols = []
 historical_profits = {}
-scan_queue = []
-currently_scanning = False
-opportunity_counter = 0
+scan_stats = {'total_scans': 0, 'active_opportunities': 0}
 
 # ============ HELPER FUNCTIONS ============
 def calculate_withdrawal_fee(exchange):
@@ -103,33 +101,38 @@ def get_exchange_link(exchange, symbol):
         return f"https://www.coinex.com/trading/{symbol}USDT"
     return "#"
 
-# ============ CONTINUOUS SCANNER ============
+# ============ SCANNER FUNCTIONS ============
 async def get_all_symbols():
     if len(exchanges) < 2:
         return []
     
+    print("📊 Loading markets from all exchanges...")
     await asyncio.gather(*[ex.load_markets() for ex in exchanges.values()])
+    
+    # Find common symbols across all exchanges
     common = set.intersection(*[set(ex.symbols) for ex in exchanges.values()])
     symbols = [s for s in common if s.endswith('/USDT')]
     
-    # Sort by historical profitability (most profitable first)
+    # Sort by historical profitability
     def get_priority(symbol):
-        if symbol in historical_profits:
-            return -historical_profits[symbol].get('last_profit', 0)  # Negative for descending
-        return 0
+        return -historical_profits.get(symbol, {}).get('last_profit', 0)
     
     symbols.sort(key=get_priority)
-    print(f"✓ Found {len(symbols)} USDT pairs (prioritized by profitability)")
+    print(f"✓ Found {len(symbols)} common USDT pairs")
     return symbols
 
 async def quick_scan_symbol(symbol):
-    """Quick scan to check if profitable"""
+    """Scan a single symbol - returns opportunity or inactive signal"""
     try:
-        obs = await asyncio.gather(*[ex.fetch_order_book(symbol, limit=1) for ex in exchanges.values()])
+        # Fetch order books from all exchanges in parallel
+        obs = await asyncio.gather(*[ex.fetch_order_book(symbol, limit=1) for ex in exchanges.values()], return_exceptions=True)
         
+        # Collect valid order book data
         data = {}
         for (name, ex), ob in zip(exchanges.items(), obs):
-            if ob['asks'] and ob['bids']:
+            if isinstance(ob, Exception):
+                continue
+            if ob and ob.get('asks') and ob.get('bids') and len(ob['asks']) > 0 and len(ob['bids']) > 0:
                 data[name] = {
                     'ask': ob['asks'][0][0],
                     'bid': ob['bids'][0][0],
@@ -137,13 +140,20 @@ async def quick_scan_symbol(symbol):
                     'bid_vol': ob['bids'][0][1] * ob['bids'][0][0],
                 }
         
+        # Need at least 2 exchanges with data
+        if len(data) < 2:
+            return {'symbol': symbol.replace('/USDT', ''), 'is_active': False}
+        
+        # Find best arbitrage opportunity for this symbol
         best_profit = 0
         best_opp = None
         
         for buy_ex, b in data.items():
             for sell_ex, s in data.items():
-                if buy_ex == sell_ex: continue
+                if buy_ex == sell_ex:
+                    continue
                 
+                # Calculate profit after trading fees
                 buy_cost = b['ask'] * (1 + TRADING_FEES.get(buy_ex, 0.1) / 100)
                 sell_rev = s['bid'] * (1 - TRADING_FEES.get(sell_ex, 0.1) / 100)
                 profit_pct = (sell_rev - buy_cost) / buy_cost * 100
@@ -153,9 +163,25 @@ async def quick_scan_symbol(symbol):
                     best_profit = profit_pct
                     best_opp = (buy_ex, sell_ex, b, s, profit_pct, liquidity)
         
+        # Check if profitable
         if best_opp and best_profit > MIN_PROFIT_PERCENT:
             buy_ex, sell_ex, b, s, profit_pct, liquidity = best_opp
+            
+            # Calculate net profit after withdrawal fees
             net_profit_usd, net_profit_pct, withdrawal_fee = calculate_net_profit(profit_pct, 100, buy_ex, sell_ex)
+            
+            # Get 24h volume (optional, for display)
+            buy_volume = 0
+            sell_volume = 0
+            try:
+                if buy_ex in exchanges:
+                    ticker = await exchanges[buy_ex].fetch_ticker(symbol)
+                    buy_volume = ticker.get('quoteVolume', 0)
+                if sell_ex in exchanges:
+                    ticker = await exchanges[sell_ex].fetch_ticker(symbol)
+                    sell_volume = ticker.get('quoteVolume', 0)
+            except:
+                pass
             
             return {
                 'symbol': symbol.replace('/USDT', ''),
@@ -170,91 +196,116 @@ async def quick_scan_symbol(symbol):
                 'liquidity': round(liquidity, 0),
                 'buy_liquidity': round(b['ask_vol'], 0),
                 'sell_liquidity': round(s['bid_vol'], 0),
-                'timestamp': time.time()
+                'buy_volume': round(buy_volume, 0),
+                'sell_volume': round(sell_volume, 0),
+                'withdrawal_network': DEFAULT_NETWORK,
+                'timestamp': time.time(),
+                'is_active': True
             }
-        return None
+        
+        # Not profitable right now
+        return {'symbol': symbol.replace('/USDT', ''), 'is_active': False}
+        
     except Exception as e:
-        return None
+        return {'symbol': symbol.replace('/USDT', ''), 'is_active': False}
 
 async def continuous_scanner():
-    global latest_opportunities, all_known_symbols, historical_profits, opportunity_counter, currently_scanning
+    global latest_opportunities, all_known_symbols, scan_stats
     
     if len(exchanges) < 2:
-        print("❌ Need at least 2 exchanges with valid API keys")
+        print("\n" + "="*60)
+        print("❌ CANNOT START SCANNER")
+        print("="*60)
+        print("Need at least 2 exchanges with valid API keys.")
+        print("\nPlease add your API keys to Render environment variables:")
+        for name in API_KEYS.keys():
+            print(f"  - {name.upper()}_API_KEY")
+            print(f"  - {name.upper()}_SECRET")
+        print("="*60)
         return
     
-    # Load all symbols once
+    # Load all symbols
     all_known_symbols = await get_all_symbols()
+    
+    if len(all_known_symbols) == 0:
+        print("❌ No common USDT pairs found across exchanges")
+        return
+    
     print(f"\n{'='*60}")
-    print(f"🔄 CONTINUOUS ARBITRAGE SCANNER ACTIVE")
+    print(f"🔄 REAL EXCHANGE ARBITRAGE SCANNER ACTIVE")
     print(f"{'='*60}")
-    print(f"📊 Connected to: {', '.join(exchanges.keys())}")
-    print(f"📈 Total symbols: {len(all_known_symbols)} USDT pairs")
-    print(f"⚡ Mode: CONTINUOUS - Never stops scanning")
-    print(f"🎯 Priority: Previously profitable symbols first")
-    print(f"💰 Min profit: {MIN_PROFIT_PERCENT}%")
+    print(f"📊 Connected exchanges: {', '.join(exchanges.keys())}")
+    print(f"📈 Total USDT pairs: {len(all_known_symbols)}")
+    print(f"💰 Min profit threshold: {MIN_PROFIT_PERCENT}%")
     print(f"💵 Min liquidity: ${MIN_LIQUIDITY_USD}")
     print(f"🏦 Withdrawal network: {DEFAULT_NETWORK}")
+    print(f"⚡ Mode: Continuous scanning (never stops)")
     print(f"{'='*60}\n")
     
-    print(f"[{time.strftime('%H:%M:%S')}] 🚀 STARTING CONTINUOUS SCAN CYCLE")
-    print(f"[{time.strftime('%H:%M:%S')}] 🔍 Scanning will run continuously without stopping\n")
-    
-    # Create a continuous scanning queue that never empties
     scan_index = 0
-    symbols_to_scan = all_known_symbols.copy()
     
     while True:
-        # Simple continuous loop - scan symbols in order, never stop
-        if scan_index >= len(symbols_to_scan):
-            scan_index = 0
-            # Re-prioritize based on recent profits
-            symbols_to_scan.sort(key=lambda s: -historical_profits.get(s, {}).get('last_profit', 0))
-            print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 Completed full cycle. Restarting priority scan...")
-        
-        # Get batch of symbols to scan
-        batch = symbols_to_scan[scan_index:scan_index + BATCH_SIZE]
-        scan_index += BATCH_SIZE
-        
-        # Scan batch in parallel
-        tasks = [quick_scan_symbol(symbol) for symbol in batch]
-        results = await asyncio.gather(*tasks)
-        
-        # Process results
-        new_opportunities = []
-        for i, result in enumerate(results):
-            if result:
-                symbol_name = batch[i].replace('/USDT', '')
-                print(f"  🎯 [{time.strftime('%H:%M:%S')}] FOUND: {result['symbol']} - {result['spread']}% spread (net: {result['net_profit']}%)")
-                
-                # Update historical profits
-                historical_profits[batch[i]] = {
-                    'last_profit': result['spread'],
-                    'last_seen': time.time(),
-                    'count': historical_profits.get(batch[i], {}).get('count', 0) + 1
-                }
-                
-                new_opportunities.append(result)
-                opportunity_counter += 1
-        
-        # Update display opportunities with new ones
-        if new_opportunities:
-            # Add new opportunities to existing ones
-            existing_symbols = {opp['symbol'] for opp in latest_opportunities}
-            for opp in new_opportunities:
-                if opp['symbol'] not in existing_symbols:
-                    latest_opportunities.append(opp)
+        try:
+            # Get batch of symbols
+            if scan_index >= len(all_known_symbols):
+                scan_index = 0
+                # Re-prioritize based on historical profits
+                all_known_symbols.sort(key=lambda s: -historical_profits.get(s, {}).get('last_profit', 0))
+                print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 Completed full cycle. Re-prioritizing {len(all_known_symbols)} symbols...")
             
-            # Sort by profit and keep top 50
-            latest_opportunities = sorted(latest_opportunities, key=lambda x: x['spread'], reverse=True)[:50]
-        
-        # Show status every few batches
-        if scan_index % (BATCH_SIZE * 5) == 0:
-            scanned_count = scan_index if scan_index < len(symbols_to_scan) else len(symbols_to_scan)
-            print(f"[{time.strftime('%H:%M:%S')}] 📊 Scanned {scanned_count}/{len(symbols_to_scan)} symbols | Found {len(latest_opportunities)} active opportunities | Total found: {opportunity_counter}")
-        
-        # Small delay to prevent rate limiting, but continuous
-        await asyncio.sleep(0.1)  # Minimal delay - keeps scanning continuously
+            batch = all_known_symbols[scan_index:scan_index + BATCH_SIZE]
+            scan_index += BATCH_SIZE
+            
+            # Scan batch in parallel
+            tasks = [quick_scan_symbol(symbol) for symbol in batch]
+            results = await asyncio.gather(*tasks)
+            
+            # Process results - Update active/inactive opportunities
+            for i, result in enumerate(results):
+                if not result:
+                    continue
+                    
+                symbol_name = batch[i].replace('/USDT', '')
+                
+                if result.get('is_active'):
+                    # This opportunity is ACTIVE
+                    historical_profits[batch[i]] = {
+                        'last_profit': result['spread'],
+                        'last_seen': time.time()
+                    }
+                    # Remove old version if exists, add new one
+                    latest_opportunities = [o for o in latest_opportunities if o['symbol'] != symbol_name]
+                    latest_opportunities.append(result)
+                    scan_stats['active_opportunities'] = len(latest_opportunities)
+                else:
+                    # This opportunity is INACTIVE - remove from UI
+                    before_count = len(latest_opportunities)
+                    latest_opportunities = [o for o in latest_opportunities if o['symbol'] != symbol_name]
+                    if before_count != len(latest_opportunities):
+                        # Only print when actually removed
+                        pass
+            
+            # Sort by profit
+            latest_opportunities.sort(key=lambda x: x['spread'], reverse=True)
+            
+            # Update scan stats
+            scan_stats['total_scans'] += 1
+            
+            # Print status every few batches
+            if scan_index % (BATCH_SIZE * 5) == 0 or scan_index <= BATCH_SIZE:
+                scanned = min(scan_index, len(all_known_symbols))
+                print(f"[{time.strftime('%H:%M:%S')}] 📊 Scanned {scanned}/{len(all_known_symbols)} symbols | Active opportunities: {len(latest_opportunities)}")
+                
+                if latest_opportunities:
+                    best = latest_opportunities[0]
+                    print(f"    🎯 Best: {best['symbol']} - {best['spread']}% spread (net: {best['net_profit']}%)")
+            
+            # Small delay to prevent rate limiting
+            await asyncio.sleep(0.1)
+            
+        except Exception as e:
+            print(f"❌ Scanner error: {e}")
+            await asyncio.sleep(1)
 
 # ============ WEB UI ============
 @app.on_event("startup")
@@ -267,7 +318,7 @@ async def get():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Continuous Arbitrage Scanner</title>
+    <title>Real Exchange Arbitrage Scanner</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -295,7 +346,7 @@ async def get():
         }
         .badge {
             display: inline-block;
-            background: #f39c12;
+            background: #2ecc71;
             color: #0a0a0a;
             padding: 4px 10px;
             border-radius: 16px;
@@ -303,7 +354,7 @@ async def get():
             font-weight: 600;
             margin: 6px 0;
         }
-        .continuous-badge {
+        .live-badge {
             background: #e74c3c;
             animation: pulse 1.5s infinite;
         }
@@ -527,56 +578,43 @@ async def get():
             padding-top: 12px;
             border-top: 1px solid #1e1e1e;
         }
-        
-        .clickable {
-            cursor: pointer;
-        }
-        
-        .new-opportunity {
-            animation: highlight 0.5s ease-out;
-        }
-        
-        @keyframes highlight {
-            0% { background: rgba(46, 204, 113, 0.3); }
-            100% { background: transparent; }
-        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🚀 Continuous Arbitrage Scanner</h1>
+            <h1>🚀 Real Exchange Arbitrage Scanner</h1>
             <div>
                 <span class="badge">📊 SPOT | USDT</span>
-                <span class="badge continuous-badge">⚡ CONTINUOUS SCANNING</span>
+                <span class="badge live-badge">🔴 LIVE EXCHANGES</span>
             </div>
         </div>
         
         <div class="stats">
-            <span><span class="live-indicator"></span> LIVE - Never stops</span>
+            <span><span class="live-indicator"></span> LIVE DATA - Real exchanges</span>
             <span id="count">0 opportunities</span>
-            <span id="scanStatus">🔍 Scanning continuously...</span>
+            <span id="scanStatus">🔄 Scanning...</span>
         </div>
         
         <div id="opportunities-container"></div>
         
         <div class="footer">
-            🔄 CONTINUOUS MODE: Scanner never stops - always finding opportunities<br>
-            ✨ Click ANY card to see full arbitrage details
+            🔴 Using REAL exchange APIs | Withdrawal fees included (ERC20)<br>
+            📊 Opportunities appear/disappear in real-time as market changes
         </div>
     </div>
 
     <script>
         let allOpportunities = [];
         let expandedCard = null;
-        let lastUpdateTime = Date.now();
         
         const ws = new WebSocket(`ws://${location.host}/ws`);
         
         function timeAgo(ts) {
             const secs = Math.floor(Date.now()/1000 - ts);
             if (secs < 60) return `${secs}s ago`;
-            return `${Math.floor(secs/60)}m ago`;
+            if (secs < 3600) return `${Math.floor(secs/60)}m ago`;
+            return `${Math.floor(secs/3600)}h ago`;
         }
         
         function formatExchange(name) {
@@ -632,7 +670,7 @@ async def get():
             document.getElementById('count').textContent = allOpportunities.length + ' opportunities';
             
             if (allOpportunities.length === 0) {
-                container.innerHTML = '<div class="no-data">⚡ CONTINUOUS SCANNING ACTIVE<br><span style="font-size: 12px;">Scanning all symbols continuously...</span><br><span style="font-size: 11px; color: #444;">Opportunities will appear instantly when found</span></div>';
+                container.innerHTML = '<div class="no-data">🔍 Scanning real exchanges...<br><span style="font-size: 12px;">No active arbitrage opportunities at this moment</span><br><span style="font-size: 11px; color: #444;">Opportunities will appear instantly when found</span></div>';
                 return;
             }
             
@@ -733,7 +771,8 @@ async def get():
         }
         
         ws.onmessage = (event) => {
-            allOpportunities = JSON.parse(event.data);
+            const newOpportunities = JSON.parse(event.data);
+            allOpportunities = newOpportunities;
             updateDisplay();
         };
         
@@ -748,28 +787,22 @@ async def get():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    last_sent = {}
+    last_sent = []
     while True:
-        # Send updates whenever opportunities change
-        current_opps = {opp['symbol']: opp for opp in latest_opportunities}
-        if current_opps != last_sent:
+        if latest_opportunities != last_sent:
             await websocket.send_json(latest_opportunities)
-            last_sent = current_opps.copy()
-        await asyncio.sleep(2)  # Check for changes every 2 seconds
+            last_sent = latest_opportunities.copy()
+        await asyncio.sleep(1)
 
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 8000))
     print(f"\n{'='*60}")
-    print(f"🚀 CONTINUOUS ARBITRAGE SCANNER")
+    print(f"🚀 REAL EXCHANGE ARBITRAGE SCANNER")
     print(f"{'='*60}")
-    print(f"⚡ Mode: CONTINUOUS - NEVER STOPS SCANNING")
-    print(f"📈 Scans symbols continuously without intervals")
-    print(f"🎯 Priority: Profitable symbols checked first")
-    print(f"🔄 Loop: Continuously cycles through all symbols")
-    print(f"🔐 Using PRIVATE API keys from Render")
-    print(f"📊 Spot Market | USDT Pairs Only")
-    print(f"💰 Withdrawal fees included ({DEFAULT_NETWORK})")
-    print(f"🏦 Exchanges: {', '.join(exchanges.keys())}")
+    print(f"🔐 Mode: REAL EXCHANGE APIS (no demo)")
+    print(f"📊 Market: SPOT | USDT pairs only")
+    print(f"💰 Withdrawal fees: {DEFAULT_NETWORK} network")
+    print(f"⚡ Scanning: Continuous - never stops")
     print(f"🌐 Web UI: http://localhost:{port}")
     print(f"{'='*60}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)

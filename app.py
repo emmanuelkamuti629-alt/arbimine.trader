@@ -7,39 +7,21 @@ import time
 import os
 
 # ============ CONFIG ============
-# Only include exchanges you have WORKING API keys for
-# Comment out any that are failing
-
 API_KEYS = {
-    # MEXC - Commented out if failing
-    # 'mexc': {
-    #     'apiKey': os.getenv('MEXC_API_KEY', ''),
-    #     'secret': os.getenv('MEXC_SECRET', ''),
-    #     'options': {'defaultType': 'spot', 'timeout': 30000}
-    # },
-    
-    # KuCoin - Commented out if passphrase wrong
-    # 'kucoin': {
-    #     'apiKey': os.getenv('KUCOIN_API_KEY', ''),
-    #     'secret': os.getenv('KUCOIN_SECRET', ''),
-    #     'password': os.getenv('KUCOIN_PASSWORD', ''),
-    #     'options': {'defaultType': 'spot', 'timeout': 30000}
-    # },
-    
     'gateio': {
         'apiKey': os.getenv('GATEIO_API_KEY', ''),
         'secret': os.getenv('GATEIO_SECRET', ''),
-        'options': {'defaultType': 'spot', 'timeout': 30000}
+        'options': {'defaultType': 'spot'}
     },
     'bitget': {
         'apiKey': os.getenv('BITGET_API_KEY', ''),
         'secret': os.getenv('BITGET_SECRET', ''),
-        'options': {'defaultType': 'spot', 'timeout': 30000}
+        'options': {'defaultType': 'spot'}
     },
     'coinex': {
         'apiKey': os.getenv('COINEX_API_KEY', ''),
         'secret': os.getenv('COINEX_SECRET', ''),
-        'options': {'defaultType': 'spot', 'timeout': 30000}
+        'options': {'defaultType': 'spot'}
     },
 }
 
@@ -57,7 +39,6 @@ WITHDRAWAL_FEES = {
 
 MIN_PROFIT_PERCENT = 0.1
 MIN_LIQUIDITY_USD = 30
-BATCH_SIZE = 10
 
 # Initialize exchanges
 exchanges = {}
@@ -110,31 +91,106 @@ async def get_all_symbols():
     
     print("📊 Loading markets from exchanges...")
     
-    working_exchanges = {}
     for name, ex in exchanges.items():
         try:
-            await asyncio.wait_for(ex.load_markets(), timeout=30.0)
-            working_exchanges[name] = ex
+            await ex.load_markets()
             usdt_count = len([s for s in ex.symbols if s.endswith('/USDT')])
             print(f"  ✓ {name}: {usdt_count} USDT pairs")
-        except asyncio.TimeoutError:
-            print(f"  ✗ {name}: Timeout")
         except Exception as e:
-            print(f"  ✗ {name}: {str(e)[:50]}")
+            print(f"  ✗ {name}: {str(e)[:80]}")
+            return []
     
-    if len(working_exchanges) < 2:
-        print(f"\n❌ Only {len(working_exchanges)} exchanges loaded. Need at least 2.")
-        return []
-    
-    # Get ALL USDT symbols from working exchanges
+    # Get ALL USDT symbols from all exchanges
     all_symbols_set = set()
-    for name, ex in working_exchanges.items():
+    for name, ex in exchanges.items():
         symbols = [s for s in ex.symbols if s.endswith('/USDT')]
         all_symbols_set.update(symbols)
     
     symbols = list(all_symbols_set)
-    print(f"\n✓ Found {len(symbols)} total USDT pairs across {len(working_exchanges)} exchanges")
+    print(f"\n✓ Found {len(symbols)} total USDT pairs across {len(exchanges)} exchanges")
     return symbols
+
+async def scan_single_symbol(symbol):
+    """Scan a single symbol across all exchanges"""
+    try:
+        symbol_clean = symbol.replace('/USDT', '')
+        
+        # Fetch order books from all exchanges
+        tasks = []
+        exchange_names = []
+        for name, ex in exchanges.items():
+            # Check if exchange has this symbol
+            if symbol in getattr(ex, 'symbols', []):
+                tasks.append(ex.fetch_order_book(symbol, limit=1))
+                exchange_names.append(name)
+        
+        if len(tasks) < 2:
+            return None
+        
+        # Wait for all order books
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        data = {}
+        for i, (name, result) in enumerate(zip(exchange_names, results)):
+            if isinstance(result, Exception):
+                continue
+            if result and result.get('asks') and result.get('bids') and len(result['asks']) > 0:
+                data[name] = {
+                    'ask': result['asks'][0][0],
+                    'bid': result['bids'][0][0] if result['bids'] else result['asks'][0][0],
+                    'ask_vol': result['asks'][0][1] * result['asks'][0][0],
+                    'bid_vol': (result['bids'][0][1] * result['bids'][0][0]) if result['bids'] else 0,
+                }
+        
+        if len(data) < 2:
+            return None
+        
+        # Find best arbitrage opportunity
+        best_profit = 0
+        best_opp = None
+        
+        for buy_ex, b in data.items():
+            for sell_ex, s in data.items():
+                if buy_ex == sell_ex:
+                    continue
+                
+                buy_cost = b['ask'] * (1 + TRADING_FEES.get(buy_ex, 0.1) / 100)
+                sell_rev = s['bid'] * (1 - TRADING_FEES.get(sell_ex, 0.1) / 100)
+                profit_pct = (sell_rev - buy_cost) / buy_cost * 100
+                liquidity = min(b['ask_vol'], s['bid_vol'])
+                
+                if profit_pct > best_profit and liquidity > MIN_LIQUIDITY_USD:
+                    best_profit = profit_pct
+                    best_opp = (buy_ex, sell_ex, b, s, profit_pct, liquidity)
+        
+        if best_opp and best_profit >= MIN_PROFIT_PERCENT:
+            buy_ex, sell_ex, b, s, profit_pct, liquidity = best_opp
+            net_profit_usd, net_profit_pct, withdrawal_fee, network = calculate_best_net_profit(
+                profit_pct, 100, buy_ex, sell_ex
+            )
+            
+            return {
+                'symbol': symbol_clean,
+                'buy_exchange': buy_ex.upper(),
+                'sell_exchange': sell_ex.upper(),
+                'buy_price': b['ask'],
+                'sell_price': s['bid'],
+                'spread': round(profit_pct, 1),
+                'net_profit': round(net_profit_pct, 1),
+                'net_profit_usd': round(net_profit_usd, 2),
+                'withdrawal_fee': round(withdrawal_fee, 2),
+                'recommended_network': network,
+                'buy_networks': get_all_networks_with_fees(buy_ex),
+                'sell_networks': get_all_networks_with_fees(sell_ex),
+                'liquidity': round(liquidity, 0),
+                'buy_liquidity': round(b['ask_vol'], 0),
+                'sell_liquidity': round(s['bid_vol'], 0),
+                'timestamp': time.time()
+            }
+        return None
+    except Exception as e:
+        return None
 
 async def continuous_scanner():
     global latest_opportunities, all_known_symbols
@@ -155,116 +211,49 @@ async def continuous_scanner():
         return
     
     print(f"\n{'='*60}")
-    print(f"🔄 SCANNER ACTIVE")
+    print(f"🔄 REAL EXCHANGE ARBITRAGE SCANNER ACTIVE")
     print(f"{'='*60}")
-    print(f"📊 Exchanges: {', '.join(exchanges.keys())}")
-    print(f"📈 Pairs: {len(all_known_symbols)}")
+    print(f"📊 Connected exchanges: {', '.join(exchanges.keys())}")
+    print(f"📈 Total pairs to scan: {len(all_known_symbols)}")
     print(f"💰 Min profit: {MIN_PROFIT_PERCENT}% | Min liquidity: ${MIN_LIQUIDITY_USD}")
+    print(f"⚡ Mode: Continuous scanning")
     print(f"{'='*60}\n")
     
-    scan_index = 0
     last_status_time = time.time()
     
     while True:
         try:
-            if scan_index >= len(all_known_symbols):
-                scan_index = 0
-                print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 Completed full cycle...")
-            
-            batch = all_known_symbols[scan_index:scan_index + BATCH_SIZE]
-            scan_index += BATCH_SIZE
-            
-            # Scan each symbol in batch
-            symbol_data = {}
-            for symbol in batch:
-                try:
-                    symbol_clean = symbol.replace('/USDT', '')
-                    # Get order books from all exchanges
-                    tasks = []
-                    ex_names = []
-                    for name, ex in exchanges.items():
-                        if symbol in ex.symbols:
-                            tasks.append(ex.fetch_order_book(symbol, limit=1))
-                            ex_names.append(name)
+            # Scan all symbols continuously
+            for i, symbol in enumerate(all_known_symbols):
+                result = await scan_single_symbol(symbol)
+                
+                if result:
+                    symbol_name = result['symbol']
+                    # Update opportunities
+                    latest_opportunities = [o for o in latest_opportunities if o['symbol'] != symbol_name]
+                    latest_opportunities.append(result)
+                    latest_opportunities.sort(key=lambda x: x['spread'], reverse=True)
+                    if len(latest_opportunities) > 50:
+                        latest_opportunities = latest_opportunities[:50]
                     
-                    if len(tasks) >= 2:
-                        obs = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
-                        
-                        data = {}
-                        for i, (name, ob) in enumerate(zip(ex_names, obs)):
-                            if isinstance(ob, Exception):
-                                continue
-                            if ob and ob.get('asks') and ob.get('bids') and len(ob['asks']) > 0:
-                                data[name] = {
-                                    'ask': ob['asks'][0][0],
-                                    'bid': ob['bids'][0][0] if ob['bids'] else ob['asks'][0][0],
-                                    'ask_vol': ob['asks'][0][1] * ob['asks'][0][0],
-                                    'bid_vol': (ob['bids'][0][1] * ob['bids'][0][0]) if ob['bids'] else 0,
-                                }
-                        
-                        if len(data) >= 2:
-                            best_profit = 0
-                            best_opp = None
-                            for buy_ex, b in data.items():
-                                for sell_ex, s in data.items():
-                                    if buy_ex == sell_ex:
-                                        continue
-                                    buy_cost = b['ask'] * (1 + TRADING_FEES.get(buy_ex, 0.1) / 100)
-                                    sell_rev = s['bid'] * (1 - TRADING_FEES.get(sell_ex, 0.1) / 100)
-                                    profit_pct = (sell_rev - buy_cost) / buy_cost * 100
-                                    liquidity = min(b['ask_vol'], s['bid_vol'])
-                                    if profit_pct > best_profit and liquidity > MIN_LIQUIDITY_USD:
-                                        best_profit = profit_pct
-                                        best_opp = (buy_ex, sell_ex, b, s, profit_pct, liquidity)
-                            
-                            if best_opp and best_profit >= MIN_PROFIT_PERCENT:
-                                buy_ex, sell_ex, b, s, profit_pct, liquidity = best_opp
-                                net_profit_usd, net_profit_pct, withdrawal_fee, network = calculate_best_net_profit(
-                                    profit_pct, 100, buy_ex, sell_ex
-                                )
-                                symbol_data[symbol_clean] = {
-                                    'symbol': symbol_clean,
-                                    'buy_exchange': buy_ex.upper(),
-                                    'sell_exchange': sell_ex.upper(),
-                                    'buy_price': b['ask'],
-                                    'sell_price': s['bid'],
-                                    'spread': round(profit_pct, 1),
-                                    'net_profit': round(net_profit_pct, 1),
-                                    'net_profit_usd': round(net_profit_usd, 2),
-                                    'withdrawal_fee': round(withdrawal_fee, 2),
-                                    'recommended_network': network,
-                                    'buy_networks': get_all_networks_with_fees(buy_ex),
-                                    'sell_networks': get_all_networks_with_fees(sell_ex),
-                                    'liquidity': round(liquidity, 0),
-                                    'buy_liquidity': round(b['ask_vol'], 0),
-                                    'sell_liquidity': round(s['bid_vol'], 0),
-                                    'timestamp': time.time()
-                                }
-                except:
-                    pass
+                    print(f"  🎯 Found: {result['symbol']} - {result['spread']}% spread on {result['buy_exchange']} → {result['sell_exchange']}")
+                
+                # Status update every 30 seconds
+                if time.time() - last_status_time > 30:
+                    last_status_time = time.time()
+                    print(f"[{time.strftime('%H:%M:%S')}] 📊 Scanned {i+1}/{len(all_known_symbols)} | Active opportunities: {len(latest_opportunities)}")
+                    if latest_opportunities:
+                        best = latest_opportunities[0]
+                        print(f"    🎯 Best: {best['symbol']} - {best['spread']}% (net: {best['net_profit']}%)")
+                
+                # Small delay to avoid rate limits
+                await asyncio.sleep(0.1)
             
-            # Update opportunities
-            for sym, opp in symbol_data.items():
-                latest_opportunities = [o for o in latest_opportunities if o['symbol'] != sym]
-                latest_opportunities.append(opp)
-            
-            latest_opportunities.sort(key=lambda x: x['spread'], reverse=True)
-            if len(latest_opportunities) > 50:
-                latest_opportunities = latest_opportunities[:50]
-            
-            # Status update every 30 seconds
-            if time.time() - last_status_time > 30:
-                last_status_time = time.time()
-                print(f"[{time.strftime('%H:%M:%S')}] 📊 Active opportunities: {len(latest_opportunities)}")
-                if latest_opportunities:
-                    best = latest_opportunities[0]
-                    print(f"    🎯 Best: {best['symbol']} - {best['spread']}%")
-            
-            await asyncio.sleep(0.5)
+            print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 Completed full scan cycle. Restarting...\n")
             
         except Exception as e:
-            print(f"❌ Error: {e}")
-            await asyncio.sleep(1)
+            print(f"❌ Scanner error: {e}")
+            await asyncio.sleep(5)
 
 # ============ WEB UI ============
 @app.on_event("startup")
@@ -330,7 +319,7 @@ async def get():
         let allOpportunities = [], expandedCard = null;
         const ws = new WebSocket(`ws://${location.host}/ws`);
         function timeAgo(ts) { const s = Math.floor(Date.now()/1000 - ts); return s < 60 ? `${s}s ago` : `${Math.floor(s/60)}m ago`; }
-        function formatExchange(n) { const names={'GATEIO':'Gate.io','KUCOIN':'KuCoin','MEXC':'MEXC','BITGET':'Bitget','COINEX':'CoinEx'}; return names[n]||n; }
+        function formatExchange(n) { const names={'GATEIO':'Gate.io','BITGET':'Bitget','COINEX':'CoinEx'}; return names[n]||n; }
         function toggleDetail(id,e) { e.stopPropagation(); const d = document.getElementById(`detail-${id}`); if(expandedCard===id){ d.classList.remove('show'); expandedCard=null; } else { if(expandedCard!==null) document.getElementById(`detail-${expandedCard}`).classList.remove('show'); d.classList.add('show'); expandedCard=id; } }
         function getExchangeLink(ex,sym) { const l=ex.toLowerCase(); if(l==='gateio') return `https://www.gate.io/trade/${sym}_USDT`; if(l==='bitget') return `https://www.bitget.com/spot/${sym}USDT`; if(l==='coinex') return `https://www.coinex.com/trading/${sym}USDT`; return '#'; }
         function updateDisplay() {
@@ -355,6 +344,8 @@ async def websocket_endpoint(websocket: WebSocket):
         if latest_opportunities != last_sent:
             await websocket.send_json(latest_opportunities)
             last_sent = latest_opportunities.copy()
+            if latest_opportunities:
+                print(f"📤 Sent {len(latest_opportunities)} opportunities to web UI")
         await asyncio.sleep(2)
 
 if __name__ == "__main__":
@@ -364,6 +355,7 @@ if __name__ == "__main__":
     print(f"{'='*60}")
     print(f"📊 Min Profit: {MIN_PROFIT_PERCENT}% | Min Liquidity: ${MIN_LIQUIDITY_USD}")
     print(f"🔐 Mode: REAL EXCHANGES ONLY")
+    print(f"⚡ Scanning: Continuous")
     print(f"🌐 Web UI: http://localhost:{port}")
     print(f"{'='*60}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)

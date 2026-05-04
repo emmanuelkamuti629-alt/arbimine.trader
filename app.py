@@ -40,8 +40,8 @@ WITHDRAWAL_FEES = {
 
 MIN_PROFIT_PERCENT = 0.1
 MIN_LIQUIDITY_USD = 30
-BATCH_SIZE = 10
-MAX_COINS_PER_EXCHANGE = 1000
+BATCH_SIZE = 20
+MAX_COINS = 500  # Only 500 coins per exchange for SPEED
 
 # Initialize exchanges
 exchanges = {}
@@ -58,8 +58,7 @@ for name, keys in API_KEYS.items():
 app = FastAPI()
 latest_opportunities = []
 all_symbols = []
-ready_exchanges = []
-kucoin_loading = True
+exchange_symbols = {}
 
 # ============ HELPER FUNCTIONS ============
 def get_lowest_fee_network(exchange):
@@ -88,75 +87,45 @@ def get_exchange_link(exchange, symbol):
         return f"https://www.kucoin.com/trade/{symbol}-USDT"
     return "#"
 
-# ============ LOAD FIRST 2 EXCHANGES (MEXC + Gate.io) ============
-async def load_first_two_exchanges():
-    global all_symbols, ready_exchanges
+# ============ PARALLEL MARKET LOADING (ULTRA FAST) ============
+async def load_single_exchange(name, ex):
+    """Load a single exchange and return its symbols"""
+    try:
+        print(f"  Loading {name}...")
+        await ex.load_markets()
+        all_usdt = [s for s in ex.symbols if s.endswith('/USDT')]
+        symbols = all_usdt[:MAX_COINS]  # Limit to 500 for speed
+        print(f"  ✓ {name}: {len(symbols)} USDT pairs loaded in {time.time():.0f}")
+        return name, symbols
+    except Exception as e:
+        print(f"  ✗ {name}: {str(e)[:50]}")
+        return name, []
+
+async def load_all_exchanges_parallel():
+    """Load all exchanges in parallel - SUPER FAST"""
+    global all_symbols, exchange_symbols
     
     print("\n" + "="*60)
-    print("📊 LOADING FIRST 2 EXCHANGES: MEXC + GATE.IO")
+    print(f"📊 LOADING {len(exchanges)} EXCHANGES IN PARALLEL (MAX {MAX_COINS} COINS EACH)")
     print("="*60)
     
+    # Load all exchanges simultaneously
+    tasks = [load_single_exchange(name, ex) for name, ex in exchanges.items()]
+    results = await asyncio.gather(*tasks)
+    
     all_symbols_set = set()
-    
-    # Load MEXC
-    if 'mexc' in exchanges:
-        try:
-            print("  Loading MEXC markets...")
-            await exchanges['mexc'].load_markets()
-            all_usdt = [s for s in exchanges['mexc'].symbols if s.endswith('/USDT')]
-            symbols = all_usdt[:MAX_COINS_PER_EXCHANGE]
+    for name, symbols in results:
+        if symbols:
+            exchange_symbols[name] = symbols
             all_symbols_set.update(symbols)
-            ready_exchanges.append('mexc')
-            print(f"  ✓ MEXC: {len(symbols)} USDT pairs loaded")
-        except Exception as e:
-            print(f"  ✗ MEXC failed: {e}")
-    
-    # Load Gate.io
-    if 'gateio' in exchanges:
-        try:
-            print("  Loading Gate.io markets...")
-            await exchanges['gateio'].load_markets()
-            all_usdt = [s for s in exchanges['gateio'].symbols if s.endswith('/USDT')]
-            symbols = all_usdt[:MAX_COINS_PER_EXCHANGE]
-            all_symbols_set.update(symbols)
-            ready_exchanges.append('gateio')
-            print(f"  ✓ Gate.io: {len(symbols)} USDT pairs loaded")
-        except Exception as e:
-            print(f"  ✗ Gate.io failed: {e}")
     
     all_symbols = list(all_symbols_set)
-    print(f"\n✅ READY TO SCAN: {len(all_symbols)} pairs from {', '.join(ready_exchanges)}")
-    print("⏳ KuCoin loading in background (will be added when ready)...")
+    
+    print(f"\n✅ TOTAL: {len(all_symbols)} unique USDT pairs")
+    print(f"📈 Exchanges loaded: {', '.join(exchange_symbols.keys())}")
     print("="*60 + "\n")
     
     return len(all_symbols) > 0
-
-# ============ LOAD KUCOIN IN BACKGROUND ============
-async def load_kucoin_background():
-    global all_symbols, ready_exchanges, kucoin_loading
-    
-    if 'kucoin' not in exchanges:
-        kucoin_loading = False
-        return
-    
-    print("\n[BACKGROUND] Loading KuCoin markets...")
-    try:
-        await exchanges['kucoin'].load_markets()
-        all_usdt = [s for s in exchanges['kucoin'].symbols if s.endswith('/USDT')]
-        symbols = all_usdt[:MAX_COINS_PER_EXCHANGE]
-        
-        # Add KuCoin symbols to existing set
-        current_set = set(all_symbols)
-        current_set.update(symbols)
-        all_symbols = list(current_set)
-        ready_exchanges.append('kucoin')
-        
-        print(f"[BACKGROUND] ✓ KuCoin: {len(symbols)} USDT pairs loaded")
-        print(f"[BACKGROUND] Total pairs now: {len(all_symbols)} from {', '.join(ready_exchanges)}")
-    except Exception as e:
-        print(f"[BACKGROUND] ✗ KuCoin failed: {e}")
-    
-    kucoin_loading = False
 
 # ============ SCAN SINGLE SYMBOL ============
 async def scan_symbol(symbol):
@@ -164,7 +133,7 @@ async def scan_symbol(symbol):
         tasks = []
         ex_names = []
         
-        for name in ready_exchanges:
+        for name in exchange_symbols.keys():
             if name in exchanges:
                 tasks.append(exchanges[name].fetch_order_book(symbol, limit=1))
                 ex_names.append(name)
@@ -236,54 +205,48 @@ async def scan_symbol(symbol):
 
 # ============ CONTINUOUS SCANNER ============
 async def continuous_scanner():
-    global latest_opportunities, all_symbols, kucoin_loading
+    global latest_opportunities, all_symbols
     
     if len(exchanges) < 2:
-        print("\n❌ Need at least 2 exchanges to start")
+        print("\n❌ Need at least 2 exchanges")
+        print(f"   Available: {list(exchanges.keys())}")
         return
     
-    # Load MEXC and Gate.io first
-    success = await load_first_two_exchanges()
+    # Load all exchanges in parallel (SUPER FAST)
+    start_time = time.time()
+    success = await load_all_exchanges_parallel()
+    load_time = time.time() - start_time
+    
     if not success:
-        print("❌ Failed to load first 2 exchanges")
+        print("❌ No symbols loaded")
         return
     
-    # Start KuCoin loading in background
-    asyncio.create_task(load_kucoin_background())
-    
-    print("🔄 STARTING CONTINUOUS SCAN WITH MEXC + GATE.IO")
+    print(f"🚀 SCANNER READY! (Loaded in {load_time:.1f} seconds)")
     print(f"💰 Target: {MIN_PROFIT_PERCENT}% profit | ${MIN_LIQUIDITY_USD} liquidity")
-    print("="*60 + "\n")
+    print(f"🔄 Scanning {len(all_symbols)} pairs continuously\n")
     
     scan_index = 0
-    last_log_time = time.time()
-    total_scanned = 0
+    last_log = time.time()
+    scanned = 0
     
     while True:
         try:
-            if len(all_symbols) == 0:
-                await asyncio.sleep(1)
-                continue
-            
+            # Process in batches
             batch = all_symbols[scan_index:scan_index + BATCH_SIZE]
             scan_index += BATCH_SIZE
             
             if scan_index >= len(all_symbols):
                 scan_index = 0
-                exchanges_str = ', '.join(ready_exchanges)
-                print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 COMPLETED FULL CYCLE - {total_scanned} scans, {len(latest_opportunities)} active opportunities")
-                print(f"    📊 Active exchanges: {exchanges_str}")
-                if kucoin_loading:
-                    print(f"    ⏳ KuCoin still loading... (will add more pairs when ready)")
-                total_scanned = 0
+                print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 FULL CYCLE - {len(latest_opportunities)} opportunities active\n")
+                scanned = 0
             
+            # Scan batch in parallel
             tasks = [scan_symbol(symbol) for symbol in batch]
             results = await asyncio.gather(*tasks)
             
-            found_in_batch = 0
+            # Process results
             for result in results:
                 if result:
-                    found_in_batch += 1
                     symbol_name = result['symbol']
                     latest_opportunities = [o for o in latest_opportunities if o['symbol'] != symbol_name]
                     latest_opportunities.append(result)
@@ -291,25 +254,19 @@ async def continuous_scanner():
                     if len(latest_opportunities) > 50:
                         latest_opportunities = latest_opportunities[:50]
                     
-                    print(f"  🎯 FOUND: {result['symbol']} - {result['spread']}% on {result['buy_exchange']} → {result['sell_exchange']}")
+                    print(f"  🎯 {result['symbol']} - {result['spread']}% ({result['buy_exchange']} → {result['sell_exchange']})")
             
-            total_scanned += len(batch)
+            scanned += len(batch)
             
-            now = time.time()
-            if now - last_log_time >= 15:
-                last_log_time = now
-                exchanges_str = ', '.join(ready_exchanges)
-                status = " (+KuCoin loading...)" if kucoin_loading else ""
-                print(f"[{time.strftime('%H:%M:%S')}] 📊 Scanned {total_scanned}/{len(all_symbols)} | Found: {found_in_batch} | Active: {len(latest_opportunities)} | Exchanges: {exchanges_str}{status}")
-                
-                if latest_opportunities:
-                    best = latest_opportunities[0]
-                    print(f"    🏆 BEST: {best['symbol']} - {best['spread']}% → {best['buy_exchange']} to {best['sell_exchange']}")
+            # Status every 10 seconds
+            if time.time() - last_log > 10:
+                last_log = time.time()
+                print(f"[{time.strftime('%H:%M:%S')}] 📊 {scanned}/{len(all_symbols)} | Active: {len(latest_opportunities)}")
             
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.02)  # Very fast cycling
             
         except Exception as e:
-            print(f"❌ Scanner error: {e}")
+            print(f"❌ Scan error: {e}")
             await asyncio.sleep(1)
 
 # ============ WEB UI ============
@@ -323,7 +280,7 @@ async def get():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Arbitrage Scanner - 2 Exchanges First</title>
+    <title>Ultra-Fast Arbitrage Scanner</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -363,32 +320,18 @@ async def get():
         .time-warning { color: #f39c12; font-size: 11px; text-align: center; padding: 10px; background: rgba(243,156,18,0.1); border-radius: 8px; }
         .no-data { text-align: center; color: #555; padding: 40px; background: #121212; border-radius: 12px; }
         .footer { text-align: center; font-size: 10px; color: #444; margin-top: 20px; padding-top: 12px; border-top: 1px solid #1e1e1e; }
-        .loading-badge { background: #f39c12; animation: pulse 1s infinite; }
-        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="header">
-            <h1>🚀 Arbitrage Scanner</h1>
-            <div>
-                <span class="badge">📊 MEXC + Gate.io (First)</span>
-                <span class="badge">🪙 1000 coins max</span>
-                <span class="badge loading-badge" id="kucoinStatus">⏳ KuCoin Loading...</span>
-            </div>
-        </div>
-        <div class="stats">
-            <span><span class="live-indicator"></span> SCANNING NOW</span>
-            <span id="count">0 opportunities</span>
-        </div>
+        <div class="header"><h1>🚀 Ultra-Fast Arbitrage Scanner</h1><div><span class="badge">📊 MEXC | Gate.io | KuCoin</span><span class="badge">⚡ 500 COINS MAX</span></div></div>
+        <div class="stats"><span><span class="live-indicator"></span> LIVE</span><span id="count">0 opportunities</span></div>
         <div id="opportunities-container"></div>
-        <div class="footer">💰 0.1%+ profit | $30+ liquidity | Scanning MEXC + Gate.io immediately</div>
+        <div class="footer">💰 0.1%+ profit | $30+ liquidity | Fast parallel loading</div>
     </div>
     <script>
         let allOpportunities = [], expandedCard = null;
-        let kucoinReady = false;
         const ws = new WebSocket(`ws://${location.host}/ws`);
-        
         function timeAgo(ts) { const s = Math.floor(Date.now()/1000 - ts); return s < 60 ? `${s}s ago` : `${Math.floor(s/60)}m ago`; }
         function formatExchange(n) { const names={'MEXC':'MEXC','GATEIO':'Gate.io','KUCOIN':'KuCoin'}; return names[n]||n; }
         function toggleDetail(id,e) { e.stopPropagation(); const d = document.getElementById(`detail-${id}`); if(expandedCard===id){ d.classList.remove('show'); expandedCard=null; } else { if(expandedCard!==null) document.getElementById(`detail-${expandedCard}`).classList.remove('show'); d.classList.add('show'); expandedCard=id; } }
@@ -396,22 +339,11 @@ async def get():
         function updateDisplay() {
             const c = document.getElementById('opportunities-container');
             document.getElementById('count').textContent = allOpportunities.length + ' opportunities';
-            if(allOpportunities.length===0){ c.innerHTML='<div class="no-data">🔍 SCANNING NOW: MEXC + Gate.io<br><span style="font-size:12px;">Looking for 0.1%+ opportunities</span><br><span style="font-size:11px; color:#f39c12;">KuCoin loading in background</span></div>'; return; }
+            if(allOpportunities.length===0){ c.innerHTML='<div class="no-data">🔍 Loading exchanges in parallel...<br><span style="font-size:12px;">MEXC | Gate.io | KuCoin</span><br><span style="font-size:11px;">Scanner will start in seconds</span></div>'; return; }
             c.innerHTML = allOpportunities.map((opp,idx)=>`<div class="opportunity-card" onclick="toggleDetail(${idx},event)"><div class="card-main"><div class="left-section"><div class="exchange-pair"><span class="buy-text">BUY</span> <span class="exchange-name">${formatExchange(opp.buy_exchange)}</span> <span class="sell-text">→ SELL</span> <span class="exchange-name">${formatExchange(opp.sell_exchange)}</span></div><div class="token-symbol">${opp.symbol}/USDT</div><div class="details-row"><span>💰 $${opp.liquidity.toLocaleString()}</span><span>⏱️ ${timeAgo(opp.timestamp)}</span></div></div><div class="profit-section"><div class="spread-percent">${opp.spread}%</div><div class="net-profit">net: ${opp.net_profit}%</div></div></div><div class="detail-expanded" id="detail-${idx}"><div class="trade-section"><div class="trade-title">1️⃣ Buy at ${formatExchange(opp.buy_exchange)}</div><div class="info-row"><span class="info-label">Lowest Ask:</span><span class="info-value">$${opp.buy_price}</span></div><div class="info-row"><span class="info-label">Liquidity:</span><span class="info-value">$${opp.buy_liquidity.toLocaleString()}</span></div><div class="network-list"><strong>Withdrawal:</strong> ${opp.recommended_network} ($${opp.withdrawal_fee})</div><div class="button-group"><a href="${getExchangeLink(opp.buy_exchange, opp.symbol)}" target="_blank" class="action-btn" onclick="event.stopPropagation()">📊 Go to ${formatExchange(opp.buy_exchange)}</a></div></div><div class="trade-section"><div class="trade-title">2️⃣ Sell at ${formatExchange(opp.sell_exchange)}</div><div class="info-row"><span class="info-label">Highest Bid:</span><span class="info-value">$${opp.sell_price}</span></div><div class="info-row"><span class="info-label">Liquidity:</span><span class="info-value">$${opp.sell_liquidity.toLocaleString()}</span></div><div class="network-list"><strong>Deposit:</strong> ${opp.recommended_network} (Free)</div><div class="button-group"><a href="${getExchangeLink(opp.sell_exchange, opp.symbol)}" target="_blank" class="action-btn" onclick="event.stopPropagation()">📊 Go to ${formatExchange(opp.sell_exchange)}</a></div></div><div class="info-row"><span class="info-label">Gross Spread:</span><span class="info-value">${opp.spread}%</span></div><div class="info-row"><span class="info-label">Net Profit:</span><span class="info-value">${opp.net_profit}% ($${opp.net_profit_usd} on $100)</span></div><div class="warning-box">⚠️ Double check coin contract before trading</div><div class="time-warning">🟢 Act fast - opportunities last 10-15 min</div></div></div>`).join('');
             expandedCard = null;
         }
-        ws.onmessage = (e) => { 
-            const data = JSON.parse(e.data);
-            if (data.kucoin_ready !== undefined) {
-                kucoinReady = data.kucoin_ready;
-                document.getElementById('kucoinStatus').textContent = kucoinReady ? '✅ KuCoin Ready' : '⏳ KuCoin Loading...';
-                document.getElementById('kucoinStatus').style.background = kucoinReady ? '#2ecc71' : '#f39c12';
-            }
-            if (data.opportunities) {
-                allOpportunities = data.opportunities;
-                updateDisplay();
-            }
-        };
+        ws.onmessage = (e) => { allOpportunities = JSON.parse(e.data); updateDisplay(); };
         ws.onclose = () => setTimeout(() => location.reload(), 3000);
     </script>
 </body>
@@ -423,23 +355,18 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     last_sent = []
     while True:
-        message = {
-            'opportunities': latest_opportunities,
-            'kucoin_ready': not kucoin_loading
-        }
-        if message != last_sent:
-            await websocket.send_json(message)
-            last_sent = message.copy()
+        if latest_opportunities != last_sent:
+            await websocket.send_json(latest_opportunities)
+            last_sent = latest_opportunities.copy()
         await asyncio.sleep(2)
 
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 10000))
     print(f"\n{'='*60}")
-    print(f"🚀 ARBITRAGE SCANNER - 2 EXCHANGES FIRST")
+    print(f"🚀 ULTRA-FAST ARBITRAGE SCANNER")
     print(f"{'='*60}")
-    print(f"📊 Loading: MEXC + Gate.io (FIRST)")
-    print(f"📊 Then: KuCoin (in background)")
-    print(f"🪙 Max coins per exchange: {MAX_COINS_PER_EXCHANGE}")
+    print(f"📊 Loading ALL 3 exchanges in PARALLEL")
+    print(f"🪙 Max coins per exchange: {MAX_COINS}")
     print(f"💰 Min Profit: {MIN_PROFIT_PERCENT}% | Min Liquidity: ${MIN_LIQUIDITY_USD}")
     print(f"🌐 Web UI: http://localhost:{port}")
     print(f"{'='*60}\n")

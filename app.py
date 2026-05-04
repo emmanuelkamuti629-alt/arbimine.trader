@@ -45,7 +45,8 @@ FEE_PERCENT = {
     'coinex': 0.2,
 }
 MIN_LIQUIDITY_USD = 100
-SCAN_INTERVAL = 30  # Changed from 4 to 30 seconds
+SCAN_INTERVAL = 5  # Scan every 5 seconds
+DISPLAY_REFRESH_INTERVAL = 30  # UI refresh every 30 seconds
 
 # Initialize exchanges
 exchanges = {}
@@ -60,6 +61,7 @@ for name, keys in API_KEYS.items():
 app = FastAPI()
 latest_opportunities = []
 last_scan_time = None
+scan_results_history = []  # Store last 6 scans (30 seconds worth)
 
 # ============ SCANNER LOGIC ============
 async def get_symbols():
@@ -110,38 +112,70 @@ async def scan_symbol(symbol):
         return []
 
 async def scanner_loop():
-    global latest_opportunities, last_scan_time
+    global latest_opportunities, last_scan_time, scan_results_history
     
     if len(exchanges) < 2:
         print("❌ Need at least 2 exchanges with valid API keys")
         return
     
     symbols = await get_symbols()
-    print(f"🔄 Starting arbitrage scanner...")
-    print(f"📊 Scanning {len(symbols)} spot USDT pairs on {len(exchanges)} exchanges")
-    print(f"⏱️  Scan interval: {SCAN_INTERVAL} seconds")
+    print(f"\n{'='*60}")
+    print(f"🔄 ARBITRAGE SCANNER ACTIVE")
+    print(f"{'='*60}")
+    print(f"📊 Connected to: {', '.join(exchanges.keys())}")
+    print(f"📈 Scanning: {len(symbols)} spot USDT pairs")
+    print(f"⏱️  Scan frequency: Every {SCAN_INTERVAL} seconds")
+    print(f"🖥️  Display refresh: Every {DISPLAY_REFRESH_INTERVAL} seconds")
     print(f"💰 Min profit: {MIN_PROFIT_PERCENT}%")
-    print(f"💵 Min liquidity: ${MIN_LIQUIDITY_USD}\n")
+    print(f"💵 Min liquidity: ${MIN_LIQUIDITY_USD}")
+    print(f"{'='*60}\n")
     
     while True:
-        start_time = time.time()
-        last_scan_time = start_time
+        scan_start = time.time()
+        last_scan_time = scan_start
         
         print(f"[{time.strftime('%H:%M:%S')}] 🔍 Scanning for opportunities...")
         
+        # Scan all symbols
         results = await asyncio.gather(*[scan_symbol(s) for s in symbols])
-        opps = [opp for sublist in results for opp in sublist]
-        latest_opportunities = sorted(opps, key=lambda x: x['profit'], reverse=True)[:50]
+        current_scan_results = [opp for sublist in results for opp in sublist]
+        
+        # Store this scan result
+        scan_results_history.append({
+            'timestamp': scan_start,
+            'opportunities': current_scan_results
+        })
+        
+        # Keep only last 30 seconds worth of scans (6 scans if 5s interval)
+        max_history = DISPLAY_REFRESH_INTERVAL // SCAN_INTERVAL
+        if len(scan_results_history) > max_history:
+            scan_results_history.pop(0)
+        
+        # Update displayed opportunities with most recent valid opportunities
+        # Show opportunities from the latest scan that had any results
+        for scan in reversed(scan_results_history):
+            if scan['opportunities']:
+                latest_opportunities = sorted(scan['opportunities'], key=lambda x: x['profit'], reverse=True)[:50]
+                break
+        else:
+            latest_opportunities = []
         
         if latest_opportunities:
             best = latest_opportunities[0]
-            print(f"[{time.strftime('%H:%M:%S')}] ✅ Found {len(latest_opportunities)} opportunities - Best: {best['symbol']} {best['profit']}% (${best['liquidity']})")
+            print(f"[{time.strftime('%H:%M:%S')}] ✅ Found {len(current_scan_results)} opportunities in this scan")
+            print(f"    Displaying {len(latest_opportunities)} best opportunities from last {DISPLAY_REFRESH_INTERVAL}s")
+            if len(current_scan_results) > 0:
+                print(f"    Best now: {best['symbol']} {best['profit']}% (${best['liquidity']})")
         else:
-            print(f"[{time.strftime('%H:%M:%S')}] 🔍 Scan complete - No opportunities found")
+            print(f"[{time.strftime('%H:%M:%S')}] 🔍 No opportunities found in this scan")
         
-        elapsed = time.time() - start_time
+        elapsed = time.time() - scan_start
         wait_time = max(0, SCAN_INTERVAL - elapsed)
-        print(f"[{time.strftime('%H:%M:%S')}] ⏳ Next scan in {wait_time:.1f} seconds\n")
+        
+        # Show next scan countdown
+        if wait_time > 0:
+            print(f"[{time.strftime('%H:%M:%S')}] ⏳ Next scan in {wait_time:.1f} seconds\n")
+        
         await asyncio.sleep(wait_time)
 
 # ============ WEB UI ============
@@ -192,6 +226,17 @@ async def get():
             font-weight: 600;
             margin: 5px 0;
         }
+        .api-badge {
+            display: inline-block;
+            background: #2ecc71;
+            color: #0a0a0a;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+            margin: 5px 0;
+            margin-left: 10px;
+        }
         .exchanges {
             text-align: center;
             color: #888;
@@ -205,11 +250,17 @@ async def get():
             color: #f39c12;
             margin: 10px 0;
         }
-        .next-scan {
+        .scan-info {
             text-align: center;
             font-size: 12px;
             color: #666;
             margin-bottom: 20px;
+        }
+        .next-scan {
+            text-align: center;
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
         }
         
         .opportunities {
@@ -328,23 +379,28 @@ async def get():
     <div class="container">
         <div class="header">
             <h1>🚀 Cross-Exchange Arbitrage Scanner</h1>
-            <div class="badge">📊 SPOT | USDT PAIRS ONLY</div>
+            <div>
+                <span class="badge">📊 SPOT | USDT PAIRS ONLY</span>
+                <span class="api-badge">🔐 REAL EXCHANGE APIS</span>
+            </div>
             <div class="exchanges">MEXC | KuCoin | Gate.io | Bitget | CoinEx</div>
             <div class="count" id="count">0 opportunities</div>
-            <div class="next-scan" id="nextScan">⏳ Next scan in 30s</div>
+            <div class="scan-info">
+                🔍 Scanning every 5 seconds | 📺 Display refreshes every 30 seconds
+            </div>
+            <div class="next-scan" id="nextScan">⏳ Next scan in 5s</div>
         </div>
         
         <div class="opportunities" id="opps"></div>
         
         <div class="footer">
-            ⚡ Scans every 30 seconds | Fees included | Profit after fees
+            🔐 Using PRIVATE API keys | REAL exchange data | Best opportunities from last 30 seconds
         </div>
     </div>
 
     <script>
         let allOpportunities = [];
         let lastUpdateTime = Date.now();
-        let countdownInterval = null;
         
         const ws = new WebSocket(`ws://${location.host}/ws`);
         
@@ -370,13 +426,14 @@ async def get():
             if (!nextScanEl) return;
             
             const elapsed = (Date.now() - lastUpdateTime) / 1000;
-            const remaining = Math.max(0, 30 - elapsed);
+            // Show scan countdown (5 seconds)
+            const scanRemaining = Math.max(0, 5 - (elapsed % 5));
             
-            if (remaining <= 0) {
+            if (scanRemaining <= 0.1) {
                 nextScanEl.innerHTML = '🔄 Scanning now...';
                 nextScanEl.classList.add('scanning');
             } else {
-                nextScanEl.innerHTML = `⏳ Next scan in ${Math.ceil(remaining)}s`;
+                nextScanEl.innerHTML = `⏳ Next scan in ${Math.ceil(scanRemaining)}s`;
                 nextScanEl.classList.remove('scanning');
             }
         }
@@ -387,7 +444,7 @@ async def get():
             
             if (allOpportunities.length === 0) {
                 countEl.innerHTML = '0 opportunities';
-                container.innerHTML = '<div class="no-data">🔍 No arbitrage opportunities found<br><span style="font-size: 12px;">Scanning every 30 seconds...</span></div>';
+                container.innerHTML = '<div class="no-data">🔍 No arbitrage opportunities found<br><span style="font-size: 12px;">Scanning REAL exchange data every 5 seconds...</span></div>';
                 return;
             }
             
@@ -435,16 +492,21 @@ async def get():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     while True:
+        # Send latest opportunities to UI
         await websocket.send_json(latest_opportunities)
-        await asyncio.sleep(1)  # Send updates every second
+        await asyncio.sleep(DISPLAY_REFRESH_INTERVAL)  # Send updates every 30 seconds
 
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 8000))
-    print(f"\n{'='*50}")
-    print(f"🚀 Arbitrage Scanner Started")
-    print(f"📊 Spot Market | USDT Pairs Only")
-    print(f"⏱️  Scan Interval: {SCAN_INTERVAL} seconds")
-    print(f"🏦 Exchanges: {', '.join(exchanges.keys())}")
+    print(f"\n{'='*60}")
+    print(f"🚀 ARBITRAGE SCANNER WITH REAL EXCHANGE APIS")
+    print(f"{'='*60}")
+    print(f"🔐 Authentication: Using YOUR private API keys from Render")
+    print(f"📊 Market Type: SPOT only")
+    print(f"💰 Pairs: */USDT only")
+    print(f"⏱️  Scan frequency: Every {SCAN_INTERVAL} seconds")
+    print(f"🖥️  Display refresh: Every {DISPLAY_REFRESH_INTERVAL} seconds")
+    print(f"🏦 Connected Exchanges: {', '.join(exchanges.keys())}")
     print(f"🌐 Web UI: http://localhost:{port}")
-    print(f"{'='*50}\n")
+    print(f"{'='*60}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)

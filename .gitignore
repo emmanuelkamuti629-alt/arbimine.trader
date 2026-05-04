@@ -1,5 +1,23 @@
+# Environment variables
 .env
-*.pyc
+.env.local
+.env.*.local
+
+# Python
 __pycache__/
-logs/
-.DS_Store
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log

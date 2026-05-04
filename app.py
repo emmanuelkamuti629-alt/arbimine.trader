@@ -44,17 +44,53 @@ TRADING_FEES = {
     'coinex': 0.2,
 }
 
+# Withdrawal fees by exchange & network (real fees)
 WITHDRAWAL_FEES = {
-    'mexc': {'ERC20': 0.14, 'TRC20': 0.10, 'BEP20': 0.05},
-    'kucoin': {'ERC20': 0.15, 'TRC20': 0.08, 'BEP20': 0.06},
-    'gateio': {'ERC20': 0.15, 'TRC20': 0.09, 'BEP20': 0.05},
-    'bitget': {'ERC20': 0.12, 'TRC20': 0.07, 'BEP20': 0.04},
-    'coinex': {'ERC20': 0.13, 'TRC20': 0.08, 'BEP20': 0.05},
+    'mexc': {
+        'ERC20': 0.14,
+        'TRC20': 0.10,
+        'BEP20': 0.05,
+        'SOL': 0.02,
+        'POLYGON': 0.08,
+        'AVAXC': 0.12,
+    },
+    'kucoin': {
+        'ERC20': 0.15,
+        'TRC20': 0.08,
+        'BEP20': 0.06,
+        'SOL': 0.01,
+        'POLYGON': 0.10,
+        'AVAXC': 0.11,
+    },
+    'gateio': {
+        'ERC20': 0.15,
+        'TRC20': 0.09,
+        'BEP20': 0.05,
+        'SOL': 0.02,
+        'POLYGON': 0.09,
+        'AVAXC': 0.10,
+    },
+    'bitget': {
+        'ERC20': 0.12,
+        'TRC20': 0.07,
+        'BEP20': 0.04,
+        'SOL': 0.01,
+        'POLYGON': 0.08,
+        'AVAXC': 0.09,
+    },
+    'coinex': {
+        'ERC20': 0.13,
+        'TRC20': 0.08,
+        'BEP20': 0.05,
+        'SOL': 0.02,
+        'POLYGON': 0.09,
+        'AVAXC': 0.10,
+    },
 }
 
-DEFAULT_NETWORK = 'ERC20'
-MIN_PROFIT_PERCENT = 0.4
-MIN_LIQUIDITY_USD = 50
+# ============ SCANNER SETTINGS ============
+MIN_PROFIT_PERCENT = 0.1  # Show 0.1% and above
+MIN_LIQUIDITY_USD = 30    # Minimum $30 liquidity
 BATCH_SIZE = 10
 
 # Initialize exchanges
@@ -67,25 +103,53 @@ for name, keys in API_KEYS.items():
         except Exception as e:
             print(f"✗ Failed to initialize {name}: {e}")
     else:
-        print(f"✗ {name}: No API keys found in environment variables")
+        print(f"✗ {name}: No API keys found")
 
 app = FastAPI()
 latest_opportunities = []
 all_known_symbols = []
 historical_profits = {}
-scan_stats = {'total_scans': 0, 'active_opportunities': 0}
 
-# ============ HELPER FUNCTIONS ============
-def calculate_withdrawal_fee(exchange):
-    fees = WITHDRAWAL_FEES.get(exchange.lower(), WITHDRAWAL_FEES['mexc'])
-    return fees.get(DEFAULT_NETWORK, 0.14)
+# ============ NETWORK HELPER FUNCTIONS ============
+def get_available_networks(exchange):
+    """Get all networks available on an exchange for withdrawals"""
+    exchange_lower = exchange.lower()
+    networks = WITHDRAWAL_FEES.get(exchange_lower, {})
+    return networks
 
-def calculate_net_profit(profit_pct, amount_usd, buy_exchange, sell_exchange):
+def get_lowest_fee_network(exchange):
+    """Get the network with the lowest withdrawal fee for an exchange"""
+    networks = get_available_networks(exchange)
+    if not networks:
+        return 'ERC20', 0.15
+    best_network = min(networks.items(), key=lambda x: x[1])
+    return best_network[0], best_network[1]
+
+def get_all_networks_with_fees(exchange):
+    """Get all networks with their fees as a formatted string"""
+    networks = get_available_networks(exchange)
+    if not networks:
+        return "ERC20 ($0.15)"
+    network_strings = []
+    for network, fee in networks.items():
+        network_strings.append(f"{network} (${fee})")
+    return " | ".join(network_strings)
+
+def calculate_best_net_profit(profit_pct, amount_usd, buy_exchange, sell_exchange):
+    """Calculate net profit using the BEST available network (lowest fees)"""
     gross_profit_usd = amount_usd * (profit_pct / 100)
-    withdrawal_fee = calculate_withdrawal_fee(buy_exchange)
-    net_profit_usd = gross_profit_usd - withdrawal_fee
+    buy_network, buy_withdrawal_fee = get_lowest_fee_network(buy_exchange)
+    sell_network, _ = get_lowest_fee_network(sell_exchange)
+    net_profit_usd = gross_profit_usd - buy_withdrawal_fee
     net_profit_pct = (net_profit_usd / amount_usd) * 100 if amount_usd > 0 else 0
-    return net_profit_usd, net_profit_pct, withdrawal_fee
+    return net_profit_usd, net_profit_pct, buy_withdrawal_fee, buy_network, sell_network
+
+def get_common_networks(buy_exchange, sell_exchange):
+    """Find networks that both exchanges support"""
+    buy_networks = set(get_available_networks(buy_exchange).keys())
+    sell_networks = set(get_available_networks(sell_exchange).keys())
+    common = buy_networks.intersection(sell_networks)
+    return list(common) if common else ['ERC20']
 
 def get_exchange_link(exchange, symbol):
     exchange_lower = exchange.lower()
@@ -109,11 +173,9 @@ async def get_all_symbols():
     print("📊 Loading markets from all exchanges...")
     await asyncio.gather(*[ex.load_markets() for ex in exchanges.values()])
     
-    # Find common symbols across all exchanges
     common = set.intersection(*[set(ex.symbols) for ex in exchanges.values()])
     symbols = [s for s in common if s.endswith('/USDT')]
     
-    # Sort by historical profitability
     def get_priority(symbol):
         return -historical_profits.get(symbol, {}).get('last_profit', 0)
     
@@ -124,10 +186,8 @@ async def get_all_symbols():
 async def quick_scan_symbol(symbol):
     """Scan a single symbol - returns opportunity or inactive signal"""
     try:
-        # Fetch order books from all exchanges in parallel
         obs = await asyncio.gather(*[ex.fetch_order_book(symbol, limit=1) for ex in exchanges.values()], return_exceptions=True)
         
-        # Collect valid order book data
         data = {}
         for (name, ex), ob in zip(exchanges.items(), obs):
             if isinstance(ob, Exception):
@@ -140,11 +200,9 @@ async def quick_scan_symbol(symbol):
                     'bid_vol': ob['bids'][0][1] * ob['bids'][0][0],
                 }
         
-        # Need at least 2 exchanges with data
         if len(data) < 2:
             return {'symbol': symbol.replace('/USDT', ''), 'is_active': False}
         
-        # Find best arbitrage opportunity for this symbol
         best_profit = 0
         best_opp = None
         
@@ -153,7 +211,6 @@ async def quick_scan_symbol(symbol):
                 if buy_ex == sell_ex:
                     continue
                 
-                # Calculate profit after trading fees
                 buy_cost = b['ask'] * (1 + TRADING_FEES.get(buy_ex, 0.1) / 100)
                 sell_rev = s['bid'] * (1 - TRADING_FEES.get(sell_ex, 0.1) / 100)
                 profit_pct = (sell_rev - buy_cost) / buy_cost * 100
@@ -163,14 +220,18 @@ async def quick_scan_symbol(symbol):
                     best_profit = profit_pct
                     best_opp = (buy_ex, sell_ex, b, s, profit_pct, liquidity)
         
-        # Check if profitable
-        if best_opp and best_profit > MIN_PROFIT_PERCENT:
+        if best_opp and best_profit >= MIN_PROFIT_PERCENT:
             buy_ex, sell_ex, b, s, profit_pct, liquidity = best_opp
             
-            # Calculate net profit after withdrawal fees
-            net_profit_usd, net_profit_pct, withdrawal_fee = calculate_net_profit(profit_pct, 100, buy_ex, sell_ex)
+            net_profit_usd, net_profit_pct, withdrawal_fee, buy_network, sell_network = calculate_best_net_profit(
+                profit_pct, 100, buy_ex, sell_ex
+            )
             
-            # Get 24h volume (optional, for display)
+            common_networks = get_common_networks(buy_ex, sell_ex)
+            buy_networks_display = get_all_networks_with_fees(buy_ex)
+            sell_networks_display = get_all_networks_with_fees(sell_ex)
+            
+            # Get 24h volume
             buy_volume = 0
             sell_volume = 0
             try:
@@ -193,24 +254,26 @@ async def quick_scan_symbol(symbol):
                 'net_profit': round(net_profit_pct, 1),
                 'net_profit_usd': round(net_profit_usd, 2),
                 'withdrawal_fee': round(withdrawal_fee, 2),
+                'recommended_network': buy_network,
+                'common_networks': common_networks,
+                'buy_networks': buy_networks_display,
+                'sell_networks': sell_networks_display,
                 'liquidity': round(liquidity, 0),
                 'buy_liquidity': round(b['ask_vol'], 0),
                 'sell_liquidity': round(s['bid_vol'], 0),
                 'buy_volume': round(buy_volume, 0),
                 'sell_volume': round(sell_volume, 0),
-                'withdrawal_network': DEFAULT_NETWORK,
                 'timestamp': time.time(),
                 'is_active': True
             }
         
-        # Not profitable right now
         return {'symbol': symbol.replace('/USDT', ''), 'is_active': False}
         
     except Exception as e:
         return {'symbol': symbol.replace('/USDT', ''), 'is_active': False}
 
 async def continuous_scanner():
-    global latest_opportunities, all_known_symbols, scan_stats
+    global latest_opportunities, all_known_symbols
     
     if len(exchanges) < 2:
         print("\n" + "="*60)
@@ -221,10 +284,11 @@ async def continuous_scanner():
         for name in API_KEYS.keys():
             print(f"  - {name.upper()}_API_KEY")
             print(f"  - {name.upper()}_SECRET")
+        if 'kucoin' in API_KEYS:
+            print(f"  - KUCOIN_PASSPHRASE")
         print("="*60)
         return
     
-    # Load all symbols
     all_known_symbols = await get_all_symbols()
     
     if len(all_known_symbols) == 0:
@@ -238,7 +302,7 @@ async def continuous_scanner():
     print(f"📈 Total USDT pairs: {len(all_known_symbols)}")
     print(f"💰 Min profit threshold: {MIN_PROFIT_PERCENT}%")
     print(f"💵 Min liquidity: ${MIN_LIQUIDITY_USD}")
-    print(f"🏦 Withdrawal network: {DEFAULT_NETWORK}")
+    print(f"🌐 Networks: Auto-selects CHEAPEST available network")
     print(f"⚡ Mode: Continuous scanning (never stops)")
     print(f"{'='*60}\n")
     
@@ -246,21 +310,17 @@ async def continuous_scanner():
     
     while True:
         try:
-            # Get batch of symbols
             if scan_index >= len(all_known_symbols):
                 scan_index = 0
-                # Re-prioritize based on historical profits
                 all_known_symbols.sort(key=lambda s: -historical_profits.get(s, {}).get('last_profit', 0))
                 print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 Completed full cycle. Re-prioritizing {len(all_known_symbols)} symbols...")
             
             batch = all_known_symbols[scan_index:scan_index + BATCH_SIZE]
             scan_index += BATCH_SIZE
             
-            # Scan batch in parallel
             tasks = [quick_scan_symbol(symbol) for symbol in batch]
             results = await asyncio.gather(*tasks)
             
-            # Process results - Update active/inactive opportunities
             for i, result in enumerate(results):
                 if not result:
                     continue
@@ -268,39 +328,29 @@ async def continuous_scanner():
                 symbol_name = batch[i].replace('/USDT', '')
                 
                 if result.get('is_active'):
-                    # This opportunity is ACTIVE
                     historical_profits[batch[i]] = {
                         'last_profit': result['spread'],
                         'last_seen': time.time()
                     }
-                    # Remove old version if exists, add new one
                     latest_opportunities = [o for o in latest_opportunities if o['symbol'] != symbol_name]
                     latest_opportunities.append(result)
-                    scan_stats['active_opportunities'] = len(latest_opportunities)
                 else:
-                    # This opportunity is INACTIVE - remove from UI
-                    before_count = len(latest_opportunities)
                     latest_opportunities = [o for o in latest_opportunities if o['symbol'] != symbol_name]
-                    if before_count != len(latest_opportunities):
-                        # Only print when actually removed
-                        pass
             
-            # Sort by profit
             latest_opportunities.sort(key=lambda x: x['spread'], reverse=True)
             
-            # Update scan stats
-            scan_stats['total_scans'] += 1
+            # Keep only top 50
+            if len(latest_opportunities) > 50:
+                latest_opportunities = latest_opportunities[:50]
             
-            # Print status every few batches
             if scan_index % (BATCH_SIZE * 5) == 0 or scan_index <= BATCH_SIZE:
                 scanned = min(scan_index, len(all_known_symbols))
-                print(f"[{time.strftime('%H:%M:%S')}] 📊 Scanned {scanned}/{len(all_known_symbols)} symbols | Active opportunities: {len(latest_opportunities)}")
+                print(f"[{time.strftime('%H:%M:%S')}] 📊 Scanned {scanned}/{len(all_known_symbols)} | Active opportunities: {len(latest_opportunities)}")
                 
                 if latest_opportunities:
                     best = latest_opportunities[0]
-                    print(f"    🎯 Best: {best['symbol']} - {best['spread']}% spread (net: {best['net_profit']}%)")
+                    print(f"    🎯 Best: {best['symbol']} - {best['spread']}% spread (net: {best['net_profit']}%) via {best['recommended_network']}")
             
-            # Small delay to prevent rate limiting
             await asyncio.sleep(0.1)
             
         except Exception as e:
@@ -318,7 +368,7 @@ async def get():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Real Exchange Arbitrage Scanner</title>
+    <title>Multi-Network Arbitrage Scanner</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -354,14 +404,8 @@ async def get():
             font-weight: 600;
             margin: 6px 0;
         }
-        .live-badge {
-            background: #e74c3c;
-            animation: pulse 1.5s infinite;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.7; }
+        .network-badge {
+            background: #3498db;
         }
         
         .stats {
@@ -413,7 +457,6 @@ async def get():
         
         .left-section {
             flex: 1;
-            cursor: pointer;
         }
         
         .exchange-pair {
@@ -442,7 +485,6 @@ async def get():
         
         .profit-section {
             text-align: right;
-            cursor: pointer;
         }
         .spread-percent {
             font-size: 22px;
@@ -499,9 +541,6 @@ async def get():
             margin-bottom: 6px;
         }
         .network-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
             background: #1a1a1a;
             padding: 8px 12px;
             border-radius: 8px;
@@ -514,6 +553,11 @@ async def get():
         }
         .fee-value {
             color: #f39c12;
+        }
+        .network-list {
+            font-size: 11px;
+            color: #888;
+            word-break: break-all;
         }
         
         .button-group {
@@ -540,7 +584,6 @@ async def get():
             background: #f39c12;
             border-color: #f39c12;
             color: #0a0a0a;
-            transform: scale(1.02);
         }
         
         .warning-box {
@@ -578,20 +621,33 @@ async def get():
             padding-top: 12px;
             border-top: 1px solid #1e1e1e;
         }
+        
+        .recommended {
+            background: rgba(46, 204, 113, 0.1);
+            border-left: 3px solid #2ecc71;
+        }
+        
+        .settings-note {
+            font-size: 10px;
+            color: #555;
+            text-align: center;
+            margin-top: 8px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🚀 Real Exchange Arbitrage Scanner</h1>
+            <h1>🚀 Multi-Network Arbitrage Scanner</h1>
             <div>
                 <span class="badge">📊 SPOT | USDT</span>
-                <span class="badge live-badge">🔴 LIVE EXCHANGES</span>
+                <span class="badge network-badge">🌐 ALL NETWORKS</span>
+                <span class="badge">💰 0.1%+ | $30+</span>
             </div>
         </div>
         
         <div class="stats">
-            <span><span class="live-indicator"></span> LIVE DATA - Real exchanges</span>
+            <span><span class="live-indicator"></span> LIVE EXCHANGES</span>
             <span id="count">0 opportunities</span>
             <span id="scanStatus">🔄 Scanning...</span>
         </div>
@@ -599,8 +655,8 @@ async def get():
         <div id="opportunities-container"></div>
         
         <div class="footer">
-            🔴 Using REAL exchange APIs | Withdrawal fees included (ERC20)<br>
-            📊 Opportunities appear/disappear in real-time as market changes
+            🌐 Shows ALL available networks per exchange | Auto-selects cheapest network<br>
+            💰 Min profit: 0.1% | Min liquidity: $30 | Continuous scanning
         </div>
     </div>
 
@@ -670,7 +726,7 @@ async def get():
             document.getElementById('count').textContent = allOpportunities.length + ' opportunities';
             
             if (allOpportunities.length === 0) {
-                container.innerHTML = '<div class="no-data">🔍 Scanning real exchanges...<br><span style="font-size: 12px;">No active arbitrage opportunities at this moment</span><br><span style="font-size: 11px; color: #444;">Opportunities will appear instantly when found</span></div>';
+                container.innerHTML = '<div class="no-data">🔍 Scanning real exchanges...<br><span style="font-size: 12px;">Looking for 0.1%+ opportunities with $30+ liquidity</span><br><span style="font-size: 11px; color: #444;">Checking ALL available networks for best fees</span></div>';
                 return;
             }
             
@@ -713,11 +769,8 @@ async def get():
                                 <span class="info-value">$${opp.buy_liquidity.toLocaleString()}</span>
                             </div>
                             <div class="network-section">
-                                <div class="network-title">Active Withdrawal Network(s) and Fees:</div>
-                                <div class="network-item">
-                                    <span class="network-name">${opp.withdrawal_network}</span>
-                                    <span class="fee-value">$${opp.withdrawal_fee}</span>
-                                </div>
+                                <div class="network-title">📤 Active Withdrawal Networks & Fees:</div>
+                                <div class="network-list">${opp.buy_networks || 'ERC20 ($0.14)'}</div>
                             </div>
                             <div class="button-group">
                                 <a href="${buyLink}" target="_blank" class="action-btn" onclick="event.stopPropagation()">📊 CHECK ON ${formatExchange(opp.buy_exchange)}</a>
@@ -735,15 +788,21 @@ async def get():
                                 <span class="info-value">$${opp.sell_liquidity.toLocaleString()}</span>
                             </div>
                             <div class="network-section">
-                                <div class="network-title">Currently Active Deposit Network(s):</div>
-                                <div class="network-item">
-                                    <span class="network-name">${opp.withdrawal_network}</span>
-                                    <span class="fee-value">Free Deposit</span>
-                                </div>
+                                <div class="network-title">📥 Active Deposit Networks:</div>
+                                <div class="network-list">${opp.sell_networks || 'ERC20 (Free)'}</div>
                             </div>
                             <div class="button-group">
                                 <a href="${sellLink}" target="_blank" class="action-btn" onclick="event.stopPropagation()">📊 CHECK ON ${formatExchange(opp.sell_exchange)}</a>
                             </div>
+                        </div>
+                        
+                        <div class="network-section recommended">
+                            <div class="network-title">✅ Recommended Network (Lowest Fee):</div>
+                            <div class="network-item">
+                                <span class="network-name">⭐ ${opp.recommended_network || 'ERC20'}</span>
+                                <span class="fee-value">Withdrawal: $${opp.withdrawal_fee}</span>
+                            </div>
+                            ${opp.common_networks && opp.common_networks.length > 1 ? `<div class="network-list" style="margin-top: 8px;">Also supported: ${opp.common_networks.filter(n => n !== opp.recommended_network).join(', ')}</div>` : ''}
                         </div>
                         
                         <div class="info-row" style="margin-top: 12px;">
@@ -751,7 +810,7 @@ async def get():
                             <span class="info-value" style="color: #2ecc71;">${opp.spread}%</span>
                         </div>
                         <div class="info-row">
-                            <span class="info-label">💰 Net Profit (after fees):</span>
+                            <span class="info-label">💰 Net Profit (after withdrawal fee):</span>
                             <span class="info-value" style="color: #2ecc71;">${opp.net_profit}% ($${opp.net_profit_usd} on $100)</span>
                         </div>
                         
@@ -771,8 +830,7 @@ async def get():
         }
         
         ws.onmessage = (event) => {
-            const newOpportunities = JSON.parse(event.data);
-            allOpportunities = newOpportunities;
+            allOpportunities = JSON.parse(event.data);
             updateDisplay();
         };
         
@@ -797,11 +855,13 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 8000))
     print(f"\n{'='*60}")
-    print(f"🚀 REAL EXCHANGE ARBITRAGE SCANNER")
+    print(f"🚀 MULTI-NETWORK ARBITRAGE SCANNER")
     print(f"{'='*60}")
-    print(f"🔐 Mode: REAL EXCHANGE APIS (no demo)")
-    print(f"📊 Market: SPOT | USDT pairs only")
-    print(f"💰 Withdrawal fees: {DEFAULT_NETWORK} network")
+    print(f"📊 Settings:")
+    print(f"   - Min Profit: {MIN_PROFIT_PERCENT}%")
+    print(f"   - Min Liquidity: ${MIN_LIQUIDITY_USD}")
+    print(f"   - Networks: ALL available (auto-select cheapest)")
+    print(f"🔐 Mode: REAL EXCHANGE APIS")
     print(f"⚡ Scanning: Continuous - never stops")
     print(f"🌐 Web UI: http://localhost:{port}")
     print(f"{'='*60}\n")

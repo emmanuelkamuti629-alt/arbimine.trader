@@ -55,7 +55,7 @@ WITHDRAWAL_FEES = {
 MIN_PROFIT_PERCENT = 0.1
 MIN_LIQUIDITY_USD = 30
 BATCH_SIZE = 10
-MARKET_LOAD_TIMEOUT = 90  # Changed from 45 to 90 seconds
+MARKET_LOAD_TIMEOUT = None  # NO TIMEOUT - will wait indefinitely
 
 # Initialize exchanges
 exchanges = {}
@@ -111,17 +111,14 @@ async def get_all_symbols():
         print("❌ Need at least 2 exchanges with valid API keys")
         return []
     
-    print(f"📊 Loading markets from exchanges (timeout: {MARKET_LOAD_TIMEOUT} seconds)...")
+    print(f"📊 Loading markets from exchanges (NO TIMEOUT - will wait indefinitely)...")
+    print("   This may take 1-3 minutes depending on exchange response times...")
     
     try:
-        # Load markets with 90 second timeout
+        # Load markets with NO TIMEOUT - will wait forever if needed
         tasks = [ex.load_markets() for ex in exchanges.values()]
-        await asyncio.wait_for(asyncio.gather(*tasks), timeout=MARKET_LOAD_TIMEOUT)
+        await asyncio.gather(*tasks)  # No timeout wrapper
         print("✓ Markets loaded successfully")
-    except asyncio.TimeoutError:
-        print(f"❌ Market loading timed out after {MARKET_LOAD_TIMEOUT} seconds")
-        print("💡 Check your API keys and network connection")
-        return []
     except Exception as e:
         print(f"❌ Error loading markets: {e}")
         return []
@@ -227,7 +224,7 @@ async def continuous_scanner():
     print(f"📊 Connected exchanges: {', '.join(exchanges.keys())}")
     print(f"📈 Total pairs to scan: {len(all_known_symbols)}")
     print(f"💰 Min profit: {MIN_PROFIT_PERCENT}% | Min liquidity: ${MIN_LIQUIDITY_USD}")
-    print(f"⏱️  Market timeout: {MARKET_LOAD_TIMEOUT} seconds")
+    print(f"⏱️  Market loading: NO TIMEOUT (waits indefinitely)")
     print(f"⚡ Mode: Continuous scanning")
     print(f"{'='*60}\n")
     
@@ -643,7 +640,7 @@ if __name__ == "__main__":
     print(f"{'='*60}")
     print(f"📊 Min Profit: {MIN_PROFIT_PERCENT}%")
     print(f"💵 Min Liquidity: ${MIN_LIQUIDITY_USD}")
-    print(f"⏱️  Market Load Timeout: {MARKET_LOAD_TIMEOUT} seconds")
+    print(f"⏱️  Market Loading: NO TIMEOUT (waits indefinitely)")
     print(f"🔐 Mode: REAL EXCHANGE APIS")
     print(f"⚡ Scanning: Continuous")
     print(f"🌐 Web UI: http://localhost:{port}")

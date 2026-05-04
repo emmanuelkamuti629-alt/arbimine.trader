@@ -11,13 +11,23 @@ import json
 API_KEYS = {
     'mexc': {'apiKey': 'YOUR_MEXC_KEY', 'secret': 'YOUR_MEXC_SECRET'},
     'kucoin': {'apiKey': 'YOUR_KUCOIN_KEY', 'secret': 'YOUR_KUCOIN_SECRET', 'password': 'YOUR_PASSPHRASE'},
+    'gateio': {'apiKey': 'YOUR_GATEIO_KEY', 'secret': 'YOUR_GATEIO_SECRET'},
+    'ascendex': {'apiKey': 'YOUR_ASCENDEX_KEY', 'secret': 'YOUR_ASCENDEX_SECRET'},
+    'bitget': {'apiKey': 'YOUR_BITGET_KEY', 'secret': 'YOUR_BITGET_SECRET'},
     'coinex': {'apiKey': 'YOUR_COINEX_KEY', 'secret': 'YOUR_COINEX_SECRET'},
 }
 
-MIN_PROFIT_PERCENT = 0.4 # Show smaller spreads since we're just scanning
-FEE_PERCENT = {'mexc': 0.1, 'kucoin': 0.1, 'coinex': 0.2}
+MIN_PROFIT_PERCENT = 0.4
+FEE_PERCENT = {
+    'mexc': 0.1, 
+    'kucoin': 0.1, 
+    'gateio': 0.1,
+    'ascendex': 0.1,
+    'bitget': 0.1,
+    'coinex': 0.2
+}
 MIN_LIQUIDITY_USD = 100
-SCAN_INTERVAL = 4 # seconds
+SCAN_INTERVAL = 4
 
 exchanges = {name: getattr(ccxt, name)(keys) for name, keys in API_KEYS.items()}
 app = FastAPI()
@@ -48,8 +58,8 @@ async def scan_symbol(symbol):
             for sell_ex, s in data.items():
                 if buy_ex == sell_ex: continue
                 
-                buy_cost = b['ask'] * (1 + FEE_PERCENT[buy_ex] / 100)
-                sell_rev = s['bid'] * (1 - FEE_PERCENT[sell_ex] / 100)
+                buy_cost = b['ask'] * (1 + FEE_PERCENT.get(buy_ex, 0.1) / 100)
+                sell_rev = s['bid'] * (1 - FEE_PERCENT.get(sell_ex, 0.1) / 100)
                 profit_pct = (sell_rev - buy_cost) / buy_cost * 100
                 liquidity = min(b['ask_vol'], s['bid_vol'])
                 
@@ -71,7 +81,7 @@ async def scan_symbol(symbol):
 async def scanner_loop():
     global latest_opportunities
     symbols = await get_symbols()
-    print(f"Scanning {len(symbols)} pairs...")
+    print(f"Scanning {len(symbols)} pairs across {len(exchanges)} exchanges...")
     
     while True:
         results = await asyncio.gather(*[scan_symbol(s) for s in symbols])
@@ -96,50 +106,50 @@ async def get():
         body {
             background: #0a0a0a;
             color: #e0e0e0;
-            font-family: 'Segoe UI', system-ui, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
             padding: 20px;
         }
-       .header {
+        .header {
             text-align: center;
             margin-bottom: 20px;
         }
-       .header h1 {
+        .header h1 {
             font-size: 24px;
             color: #fff;
             margin-bottom: 5px;
         }
-       .stats {
+        .stats {
             text-align: center;
             color: #888;
             font-size: 14px;
             margin-bottom: 20px;
         }
-       .filters {
-            max-width: 600px;
+        .filters {
+            max-width: 700px;
             margin: 0 auto 20px;
             background: #151515;
             border-radius: 12px;
             padding: 15px;
             border: 1px solid #2a2a2a;
         }
-       .filter-group {
+        .filter-group {
             display: flex;
             gap: 15px;
             flex-wrap: wrap;
             align-items: center;
             justify-content: space-between;
         }
-       .filter-item {
+        .filter-item {
             flex: 1;
-            min-width: 150px;
+            min-width: 130px;
         }
-       .filter-item label {
+        .filter-item label {
             display: block;
             font-size: 12px;
             color: #888;
             margin-bottom: 5px;
         }
-       .filter-item input, .filter-item select {
+        .filter-item input {
             width: 100%;
             background: #0a0a0a;
             border: 1px solid #2a2a2a;
@@ -148,114 +158,135 @@ async def get():
             border-radius: 6px;
             font-size: 14px;
         }
-       .filter-item input:focus, .filter-item select:focus {
+        .filter-item input:focus {
             outline: none;
             border-color: #f39c12;
         }
-       .exchange-buttons {
+        .exchange-buttons {
             display: flex;
-            gap: 10px;
+            gap: 8px;
             margin-top: 15px;
             flex-wrap: wrap;
+            align-items: center;
         }
-       .exchange-btn {
+        .exchange-btn {
             background: #0a0a0a;
             border: 1px solid #2a2a2a;
             color: #888;
-            padding: 6px 12px;
+            padding: 5px 12px;
             border-radius: 6px;
             cursor: pointer;
             font-size: 12px;
             transition: all 0.3s;
         }
-       .exchange-btn.active {
+        .exchange-btn.active {
             background: #f39c12;
             border-color: #f39c12;
             color: #0a0a0a;
         }
-       .reset-btn {
+        .reset-btn {
             background: #2a2a2a;
             border: 1px solid #3a3a3a;
             color: #e0e0e0;
-            padding: 6px 12px;
+            padding: 5px 12px;
             border-radius: 6px;
             cursor: pointer;
             font-size: 12px;
+            margin-left: 10px;
         }
-       .opportunities {
-            max-width: 600px;
+        .opportunities {
+            max-width: 700px;
             margin: 0 auto;
         }
-       .card {
+        .card {
             background: #151515;
             border: 1px solid #2a2a2a;
-            border-radius: 12px;
-            padding: 16px;
-            margin-bottom: 12px;
+            border-radius: 10px;
+            padding: 14px 18px;
+            margin-bottom: 10px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            transition: all 0.3s;
+            transition: all 0.2s;
         }
-       .card:hover {
+        .card:hover {
             border-color: #3a3a3a;
-            transform: translateY(-2px);
+            background: #181818;
         }
-       .left {
+        .left {
             display: flex;
-            gap: 12px;
             align-items: center;
+            gap: 20px;
+            flex-wrap: wrap;
         }
-       .exchanges {
-            background: #1a1a1a;
-            border-radius: 8px;
-            padding: 8px 12px;
-            min-width: 110px;
-        }
-       .buy,.sell {
-            font-size: 12px;
-            font-weight: 600;
-            letter-spacing: 0.5px;
-        }
-       .buy { color: #f1c40f; }
-       .sell { color: #f1c40f; }
-       .ex-name { color: #fff; margin-left: 6px; }
-       .info {
+        .exchange-row {
             display: flex;
-            flex-direction: column;
-            gap: 4px;
+            gap: 8px;
+            align-items: center;
+            background: #1a1a1a;
+            padding: 6px 14px;
+            border-radius: 8px;
         }
-       .symbol {
-            font-size: 18px;
+        .exchange-badge {
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .exchange-badge.buy {
+            color: #f1c40f;
+        }
+        .exchange-badge.sell {
+            color: #f1c40f;
+        }
+        .exchange-name {
+            color: #fff;
+            font-weight: 600;
+            margin-left: 4px;
+        }
+        .symbol {
+            font-size: 16px;
             font-weight: 700;
             color: #fff;
+            font-family: 'Courier New', monospace;
+            letter-spacing: 0.5px;
         }
-       .liquidity {
-            font-size: 13px;
+        .details {
+            display: flex;
+            gap: 20px;
+            font-size: 12px;
             color: #888;
         }
-       .verified {
-            font-size: 12px;
+        .liquidity {
+            color: #888;
+        }
+        .verified {
             color: #f39c12;
         }
-       .profit {
-            font-size: 24px;
+        .profit {
+            font-size: 22px;
             font-weight: 700;
+            font-family: 'Courier New', monospace;
         }
-       .profit.high { color: #2ecc71; }
-       .profit.mid { color: #2ecc71; }
-       .profit.low { color: #27ae60; }
-       .no-data {
+        .profit.high { color: #2ecc71; }
+        .profit.mid { color: #2ecc71; }
+        .profit.low { color: #27ae60; }
+        .no-data {
             text-align: center;
             color: #555;
             padding: 40px;
+        }
+        @media (max-width: 600px) {
+            .left { gap: 10px; }
+            .exchange-row { padding: 4px 10px; }
+            .symbol { font-size: 14px; }
+            .profit { font-size: 18px; }
+            .details { font-size: 10px; gap: 10px; }
         }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>Cross-Exchange Arbitrage Scanner</h1>
-        <div class="stats">MEXC | KuCoin | CoinEx | <span id="count">0</span> opportunities</div>
+        <div class="stats"><span id="exchange-list"></span> | <span id="count">0</span> opportunities</div>
     </div>
     
     <div class="filters">
@@ -270,16 +301,19 @@ async def get():
             </div>
             <div class="filter-item">
                 <label>Symbol Filter</label>
-                <input type="text" id="symbolFilter" placeholder="e.g., BTC, ETH">
+                <input type="text" id="symbolFilter" placeholder="e.g., GHX, WKC">
             </div>
         </div>
         <div class="exchange-buttons">
-            <span style="color: #888; font-size: 12px; margin-right: 10px;">Show pairs with:</span>
+            <span style="color: #888; font-size: 12px;">Show pairs with:</span>
             <button class="exchange-btn active" data-exchange="all">All</button>
             <button class="exchange-btn" data-exchange="MEXC">MEXC</button>
             <button class="exchange-btn" data-exchange="KUCOIN">KuCoin</button>
+            <button class="exchange-btn" data-exchange="GATEIO">Gate.io</button>
+            <button class="exchange-btn" data-exchange="ASCENDEX">Ascendex</button>
+            <button class="exchange-btn" data-exchange="BITGET">Bitget</button>
             <button class="exchange-btn" data-exchange="COINEX">CoinEx</button>
-            <button class="reset-btn" id="resetFilters">Reset Filters</button>
+            <button class="reset-btn" id="resetFilters">Reset</button>
         </div>
     </div>
     
@@ -293,6 +327,10 @@ async def get():
             symbolFilter: '',
             exchangeFilter: 'all'
         };
+        
+        // Set exchange list in header
+        document.getElementById('exchange-list').textContent = 
+            Object.keys(['MEXC', 'KuCoin', 'Gate.io', 'Ascendex', 'Bitget', 'CoinEx']).join(' | ');
         
         const ws = new WebSocket(`ws://${location.host}/ws`);
         
@@ -308,24 +346,28 @@ async def get():
             return 'low';
         }
         
+        function formatExchangeName(name) {
+            const names = {
+                'GATEIO': 'Gate.io',
+                'KUCOIN': 'KuCoin',
+                'MEXC': 'MEXC',
+                'ASCENDEX': 'Ascendex',
+                'BITGET': 'Bitget',
+                'COINEX': 'CoinEx'
+            };
+            return names[name] || name;
+        }
+        
         function filterOpportunities() {
             return allOpportunities.filter(opp => {
-                // Apply profit filter
                 if (opp.profit < currentFilters.minProfit) return false;
-                
-                // Apply liquidity filter
                 if (opp.liquidity < currentFilters.minLiquidity) return false;
-                
-                // Apply symbol filter
                 if (currentFilters.symbolFilter && 
                     !opp.symbol.toUpperCase().includes(currentFilters.symbolFilter.toUpperCase())) return false;
-                
-                // Apply exchange filter
                 if (currentFilters.exchangeFilter !== 'all') {
                     if (opp.buy_exchange !== currentFilters.exchangeFilter && 
                         opp.sell_exchange !== currentFilters.exchangeFilter) return false;
                 }
-                
                 return true;
             });
         }
@@ -343,14 +385,18 @@ async def get():
             container.innerHTML = filtered.map(opp => `
                 <div class="card">
                     <div class="left">
-                        <div class="exchanges">
-                            <div class="buy">BUY <span class="ex-name">${opp.buy_exchange}</span></div>
-                            <div class="sell">SELL <span class="ex-name">${opp.sell_exchange}</span></div>
+                        <div class="exchange-row">
+                            <span class="exchange-badge buy">BUY</span>
+                            <span class="exchange-name">${formatExchangeName(opp.buy_exchange)}</span>
                         </div>
-                        <div class="info">
-                            <div class="symbol">${opp.symbol}</div>
-                            <div class="liquidity">Liquidity: $${opp.liquidity.toLocaleString()}</div>
-                            <div class="verified">Last Verified ${timeAgo(opp.timestamp)}</div>
+                        <div class="exchange-row">
+                            <span class="exchange-badge sell">SELL</span>
+                            <span class="exchange-name">${formatExchangeName(opp.sell_exchange)}</span>
+                        </div>
+                        <div class="symbol">${opp.symbol}</div>
+                        <div class="details">
+                            <span class="liquidity">Liquidity: $${opp.liquidity.toLocaleString()}</span>
+                            <span class="verified">Last Verified ${timeAgo(opp.timestamp)}</span>
                         </div>
                     </div>
                     <div class="profit ${profitClass(opp.profit)}">${opp.profit}%</div>
@@ -358,7 +404,7 @@ async def get():
             `).join('');
         }
         
-        // Setup event listeners for filters
+        // Event listeners
         document.getElementById('minProfit').addEventListener('input', (e) => {
             currentFilters.minProfit = parseFloat(e.target.value) || 0;
             updateDisplay();
@@ -402,6 +448,10 @@ async def get():
         ws.onmessage = (event) => {
             allOpportunities = JSON.parse(event.data);
             updateDisplay();
+        };
+        
+        ws.onclose = () => {
+            setTimeout(() => location.reload(), 3000);
         };
     </script>
 </body>

@@ -101,82 +101,114 @@ async def get():
 <html>
 <head>
     <title>Cross-Exchange Arbitrage Scanner</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             background: #0a0a0a;
             color: #e0e0e0;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-            padding: 20px;
+            padding: 30px 20px;
+            font-size: 18px;
         }
+        
+        /* Container */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        /* Header */
         .header {
             text-align: center;
-            margin-bottom: 20px;
+            margin-bottom: 30px;
         }
         .header h1 {
-            font-size: 24px;
+            font-size: 36px;
             color: #fff;
-            margin-bottom: 5px;
+            margin-bottom: 10px;
+            letter-spacing: -0.5px;
         }
         .stats {
             text-align: center;
             color: #888;
-            font-size: 14px;
-            margin-bottom: 20px;
+            font-size: 18px;
+            margin-bottom: 30px;
         }
+        .stats span {
+            font-size: 24px;
+            font-weight: bold;
+            color: #f39c12;
+        }
+        
+        /* Filters Section */
         .filters {
-            max-width: 700px;
-            margin: 0 auto 20px;
             background: #151515;
-            border-radius: 12px;
-            padding: 15px;
+            border-radius: 16px;
+            padding: 25px;
             border: 1px solid #2a2a2a;
+            margin-bottom: 30px;
         }
         .filter-group {
             display: flex;
-            gap: 15px;
+            gap: 20px;
             flex-wrap: wrap;
-            align-items: center;
-            justify-content: space-between;
+            margin-bottom: 20px;
         }
         .filter-item {
             flex: 1;
-            min-width: 130px;
+            min-width: 180px;
         }
         .filter-item label {
             display: block;
-            font-size: 12px;
+            font-size: 14px;
             color: #888;
-            margin-bottom: 5px;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 600;
         }
         .filter-item input {
             width: 100%;
             background: #0a0a0a;
             border: 1px solid #2a2a2a;
             color: #e0e0e0;
-            padding: 8px 12px;
-            border-radius: 6px;
-            font-size: 14px;
+            padding: 12px 15px;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 500;
         }
         .filter-item input:focus {
             outline: none;
             border-color: #f39c12;
         }
+        
+        /* Exchange Buttons */
+        .exchange-section {
+            margin-top: 20px;
+        }
+        .exchange-label {
+            font-size: 14px;
+            color: #888;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 600;
+        }
         .exchange-buttons {
             display: flex;
-            gap: 8px;
-            margin-top: 15px;
+            gap: 10px;
             flex-wrap: wrap;
-            align-items: center;
         }
         .exchange-btn {
             background: #0a0a0a;
             border: 1px solid #2a2a2a;
             color: #888;
-            padding: 5px 12px;
-            border-radius: 6px;
+            padding: 10px 18px;
+            border-radius: 10px;
             cursor: pointer;
-            font-size: 12px;
+            font-size: 15px;
+            font-weight: 600;
             transition: all 0.3s;
         }
         .exchange-btn.active {
@@ -188,136 +220,202 @@ async def get():
             background: #2a2a2a;
             border: 1px solid #3a3a3a;
             color: #e0e0e0;
-            padding: 5px 12px;
-            border-radius: 6px;
+            padding: 10px 18px;
+            border-radius: 10px;
             cursor: pointer;
-            font-size: 12px;
-            margin-left: 10px;
+            font-size: 15px;
+            font-weight: 600;
+            margin-left: 5px;
         }
+        
+        /* Opportunities List */
         .opportunities {
-            max-width: 700px;
-            margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
         }
+        
+        /* Card - LARGER AND MORE READABLE */
         .card {
             background: #151515;
             border: 1px solid #2a2a2a;
-            border-radius: 10px;
-            padding: 14px 18px;
-            margin-bottom: 10px;
+            border-radius: 16px;
+            padding: 20px 25px;
+            transition: all 0.2s;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            transition: all 0.2s;
+            flex-wrap: wrap;
+            gap: 15px;
         }
         .card:hover {
-            border-color: #3a3a3a;
-            background: #181818;
+            border-color: #f39c12;
+            background: #1a1a1a;
+            transform: translateX(5px);
         }
-        .left {
-            display: flex;
-            align-items: center;
-            gap: 20px;
-            flex-wrap: wrap;
+        
+        /* Left side content */
+        .card-left {
+            flex: 1;
+            min-width: 250px;
         }
+        
+        /* Exchange row */
         .exchange-row {
             display: flex;
-            gap: 8px;
-            align-items: center;
-            background: #1a1a1a;
-            padding: 6px 14px;
-            border-radius: 8px;
+            align-items: baseline;
+            gap: 15px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
         }
         .exchange-badge {
-            font-size: 13px;
-            font-weight: 600;
+            font-size: 16px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
         }
         .exchange-badge.buy {
             color: #f1c40f;
+            background: rgba(241, 196, 15, 0.1);
+            padding: 4px 10px;
+            border-radius: 6px;
         }
         .exchange-badge.sell {
             color: #f1c40f;
+            background: rgba(241, 196, 15, 0.1);
+            padding: 4px 10px;
+            border-radius: 6px;
         }
         .exchange-name {
             color: #fff;
-            font-weight: 600;
-            margin-left: 4px;
-        }
-        .symbol {
-            font-size: 16px;
             font-weight: 700;
+            font-size: 18px;
+            margin-left: 5px;
+        }
+        
+        /* Symbol */
+        .symbol {
+            font-size: 24px;
+            font-weight: 800;
             color: #fff;
             font-family: 'Courier New', monospace;
-            letter-spacing: 0.5px;
+            letter-spacing: 1px;
+            margin: 10px 0;
         }
+        
+        /* Details row */
         .details {
             display: flex;
-            gap: 20px;
-            font-size: 12px;
+            gap: 25px;
+            font-size: 15px;
             color: #888;
+            flex-wrap: wrap;
         }
         .liquidity {
-            color: #888;
+            color: #aaa;
         }
         .verified {
             color: #f39c12;
         }
+        
+        /* Profit - BIG emphasis */
         .profit {
-            font-size: 22px;
-            font-weight: 700;
+            font-size: 32px;
+            font-weight: 800;
             font-family: 'Courier New', monospace;
+            text-align: right;
+            min-width: 100px;
         }
-        .profit.high { color: #2ecc71; }
-        .profit.mid { color: #2ecc71; }
-        .profit.low { color: #27ae60; }
+        .profit.high { 
+            color: #2ecc71;
+            text-shadow: 0 0 10px rgba(46, 204, 113, 0.3);
+        }
+        .profit.mid { 
+            color: #2ecc71;
+        }
+        .profit.low { 
+            color: #27ae60;
+        }
+        
+        /* No data message */
         .no-data {
             text-align: center;
             color: #555;
-            padding: 40px;
+            padding: 60px;
+            font-size: 20px;
+            background: #151515;
+            border-radius: 16px;
+            border: 1px solid #2a2a2a;
         }
-        @media (max-width: 600px) {
-            .left { gap: 10px; }
-            .exchange-row { padding: 4px 10px; }
-            .symbol { font-size: 14px; }
-            .profit { font-size: 18px; }
-            .details { font-size: 10px; gap: 10px; }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            body { padding: 15px; }
+            .header h1 { font-size: 28px; }
+            .symbol { font-size: 20px; }
+            .profit { font-size: 24px; }
+            .card { padding: 15px; }
+            .exchange-name { font-size: 15px; }
+            .exchange-badge { font-size: 13px; }
+            .details { font-size: 12px; gap: 15px; }
+        }
+        
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 10px;
+            background: #0a0a0a;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #2a2a2a;
+            border-radius: 5px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #f39c12;
         }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>Cross-Exchange Arbitrage Scanner</h1>
-        <div class="stats"><span id="exchange-list"></span> | <span id="count">0</span> opportunities</div>
-    </div>
-    
-    <div class="filters">
-        <div class="filter-group">
-            <div class="filter-item">
-                <label>Min Profit (%)</label>
-                <input type="number" id="minProfit" step="0.1" value="0.4">
-            </div>
-            <div class="filter-item">
-                <label>Min Liquidity ($)</label>
-                <input type="number" id="minLiquidity" step="100" value="100">
-            </div>
-            <div class="filter-item">
-                <label>Symbol Filter</label>
-                <input type="text" id="symbolFilter" placeholder="e.g., GHX, WKC">
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Cross-Exchange Arbitrage Scanner</h1>
+            <div class="stats">
+                📊 MEXC | KuCoin | Gate.io | Ascendex | Bitget | CoinEx 
+                &nbsp;|&nbsp; <span id="count">0</span> opportunities found
             </div>
         </div>
-        <div class="exchange-buttons">
-            <span style="color: #888; font-size: 12px;">Show pairs with:</span>
-            <button class="exchange-btn active" data-exchange="all">All</button>
-            <button class="exchange-btn" data-exchange="MEXC">MEXC</button>
-            <button class="exchange-btn" data-exchange="KUCOIN">KuCoin</button>
-            <button class="exchange-btn" data-exchange="GATEIO">Gate.io</button>
-            <button class="exchange-btn" data-exchange="ASCENDEX">Ascendex</button>
-            <button class="exchange-btn" data-exchange="BITGET">Bitget</button>
-            <button class="exchange-btn" data-exchange="COINEX">CoinEx</button>
-            <button class="reset-btn" id="resetFilters">Reset</button>
+        
+        <div class="filters">
+            <div class="filter-group">
+                <div class="filter-item">
+                    <label>💰 Min Profit (%)</label>
+                    <input type="number" id="minProfit" step="0.1" value="0.4">
+                </div>
+                <div class="filter-item">
+                    <label>💎 Min Liquidity ($)</label>
+                    <input type="number" id="minLiquidity" step="100" value="100">
+                </div>
+                <div class="filter-item">
+                    <label>🔍 Symbol Filter</label>
+                    <input type="text" id="symbolFilter" placeholder="e.g., BTC, ETH, GHX">
+                </div>
+            </div>
+            
+            <div class="exchange-section">
+                <div class="exchange-label">🏦 Filter by Exchange</div>
+                <div class="exchange-buttons">
+                    <button class="exchange-btn active" data-exchange="all">All</button>
+                    <button class="exchange-btn" data-exchange="MEXC">MEXC</button>
+                    <button class="exchange-btn" data-exchange="KUCOIN">KuCoin</button>
+                    <button class="exchange-btn" data-exchange="GATEIO">Gate.io</button>
+                    <button class="exchange-btn" data-exchange="ASCENDEX">Ascendex</button>
+                    <button class="exchange-btn" data-exchange="BITGET">Bitget</button>
+                    <button class="exchange-btn" data-exchange="COINEX">CoinEx</button>
+                    <button class="reset-btn" id="resetFilters">🔄 Reset All</button>
+                </div>
+            </div>
         </div>
+        
+        <div class="opportunities" id="opps"></div>
     </div>
-    
-    <div class="opportunities" id="opps"></div>
 
     <script>
         let allOpportunities = [];
@@ -328,16 +426,13 @@ async def get():
             exchangeFilter: 'all'
         };
         
-        // Set exchange list in header
-        document.getElementById('exchange-list').textContent = 
-            Object.keys(['MEXC', 'KuCoin', 'Gate.io', 'Ascendex', 'Bitget', 'CoinEx']).join(' | ');
-        
         const ws = new WebSocket(`ws://${location.host}/ws`);
         
         function timeAgo(ts) {
             const secs = Math.floor(Date.now()/1000 - ts);
-            if (secs < 60) return `${secs} seconds ago`;
-            return `${Math.floor(secs/60)} min ago`;
+            if (secs < 60) return `${secs} second${secs !== 1 ? 's' : ''} ago`;
+            const mins = Math.floor(secs / 60);
+            return `${mins} minute${mins !== 1 ? 's' : ''} ago`;
         }
         
         function profitClass(p) {
@@ -378,25 +473,23 @@ async def get():
             document.getElementById('count').textContent = filtered.length;
             
             if (filtered.length === 0) {
-                container.innerHTML = '<div class="no-data">No opportunities match your filters</div>';
+                container.innerHTML = '<div class="no-data">🔍 No arbitrage opportunities match your filters<br><span style="font-size: 14px;">Try lowering the minimum profit or liquidity requirements</span></div>';
                 return;
             }
             
             container.innerHTML = filtered.map(opp => `
                 <div class="card">
-                    <div class="left">
+                    <div class="card-left">
                         <div class="exchange-row">
-                            <span class="exchange-badge buy">BUY</span>
+                            <span class="exchange-badge buy">🟢 BUY</span>
                             <span class="exchange-name">${formatExchangeName(opp.buy_exchange)}</span>
-                        </div>
-                        <div class="exchange-row">
-                            <span class="exchange-badge sell">SELL</span>
+                            <span class="exchange-badge sell">🔴 SELL</span>
                             <span class="exchange-name">${formatExchangeName(opp.sell_exchange)}</span>
                         </div>
-                        <div class="symbol">${opp.symbol}</div>
+                        <div class="symbol">📈 ${opp.symbol}</div>
                         <div class="details">
-                            <span class="liquidity">Liquidity: $${opp.liquidity.toLocaleString()}</span>
-                            <span class="verified">Last Verified ${timeAgo(opp.timestamp)}</span>
+                            <span class="liquidity">💵 Liquidity: $${opp.liquidity.toLocaleString()}</span>
+                            <span class="verified">⏱️ Last verified ${timeAgo(opp.timestamp)}</span>
                         </div>
                     </div>
                     <div class="profit ${profitClass(opp.profit)}">${opp.profit}%</div>
@@ -451,6 +544,7 @@ async def get():
         };
         
         ws.onclose = () => {
+            console.log('WebSocket disconnected, reconnecting...');
             setTimeout(() => location.reload(), 3000);
         };
     </script>

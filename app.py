@@ -39,6 +39,7 @@ WITHDRAWAL_FEES = {
 
 MIN_PROFIT_PERCENT = 0.1
 MIN_LIQUIDITY_USD = 30
+BATCH_SIZE = 10
 
 # Initialize exchanges
 exchanges = {}
@@ -83,6 +84,15 @@ def get_exchange_link(exchange, symbol):
         return f"https://www.coinex.com/trading/{symbol}USDT"
     return "#"
 
+# ============ SAFE FETCH FUNCTION ============
+async def fetch_ob_safe(name, ex, symbol):
+    """Safely fetch order book with timeout"""
+    try:
+        ob = await asyncio.wait_for(ex.fetch_order_book(symbol, limit=1), timeout=10.0)
+        return name, ob
+    except Exception as e:
+        return name, None
+
 # ============ SCANNER FUNCTIONS ============
 async def get_all_symbols():
     if len(exchanges) < 2:
@@ -110,43 +120,32 @@ async def get_all_symbols():
     print(f"\n✓ Found {len(symbols)} total USDT pairs across {len(exchanges)} exchanges")
     return symbols
 
-async def scan_single_symbol(symbol):
-    """Scan a single symbol across all exchanges"""
+async def quick_scan_symbol(symbol):
+    """Scan a single symbol across all exchanges with safe fetching"""
     try:
-        symbol_clean = symbol.replace('/USDT', '')
-        
-        # Fetch order books from all exchanges
+        # Create tasks as name, coroutine pairs so we know which failed
         tasks = []
-        exchange_names = []
         for name, ex in exchanges.items():
-            # Check if exchange has this symbol
-            if symbol in getattr(ex, 'symbols', []):
-                tasks.append(ex.fetch_order_book(symbol, limit=1))
-                exchange_names.append(name)
+            tasks.append(fetch_ob_safe(name, ex, symbol))
         
-        if len(tasks) < 2:
-            return None
-        
-        # Wait for all order books
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results
+        results = await asyncio.gather(*tasks)
         data = {}
-        for i, (name, result) in enumerate(zip(exchange_names, results)):
-            if isinstance(result, Exception):
+        
+        for name, result in results:
+            if result is None:
                 continue
-            if result and result.get('asks') and result.get('bids') and len(result['asks']) > 0:
+            ob = result
+            if ob and ob.get('asks') and ob.get('bids') and len(ob['asks']) > 0:
                 data[name] = {
-                    'ask': result['asks'][0][0],
-                    'bid': result['bids'][0][0] if result['bids'] else result['asks'][0][0],
-                    'ask_vol': result['asks'][0][1] * result['asks'][0][0],
-                    'bid_vol': (result['bids'][0][1] * result['bids'][0][0]) if result['bids'] else 0,
+                    'ask': ob['asks'][0][0],
+                    'bid': ob['bids'][0][0] if ob['bids'] else ob['asks'][0][0],
+                    'ask_vol': ob['asks'][0][1] * ob['asks'][0][0],
+                    'bid_vol': (ob['bids'][0][1] * ob['bids'][0][0]) if ob['bids'] else 0,
                 }
         
         if len(data) < 2:
             return None
         
-        # Find best arbitrage opportunity
         best_profit = 0
         best_opp = None
         
@@ -171,7 +170,7 @@ async def scan_single_symbol(symbol):
             )
             
             return {
-                'symbol': symbol_clean,
+                'symbol': symbol.replace('/USDT', ''),
                 'buy_exchange': buy_ex.upper(),
                 'sell_exchange': sell_ex.upper(),
                 'buy_price': b['ask'],
@@ -216,20 +215,30 @@ async def continuous_scanner():
     print(f"📊 Connected exchanges: {', '.join(exchanges.keys())}")
     print(f"📈 Total pairs to scan: {len(all_known_symbols)}")
     print(f"💰 Min profit: {MIN_PROFIT_PERCENT}% | Min liquidity: ${MIN_LIQUIDITY_USD}")
-    print(f"⚡ Mode: Continuous scanning")
+    print(f"⚡ Mode: Continuous scanning with safe fetching")
     print(f"{'='*60}\n")
     
     last_status_time = time.time()
+    scan_index = 0
     
     while True:
         try:
-            # Scan all symbols continuously
-            for i, symbol in enumerate(all_known_symbols):
-                result = await scan_single_symbol(symbol)
-                
+            # Process in batches
+            batch = all_known_symbols[scan_index:scan_index + BATCH_SIZE]
+            scan_index += BATCH_SIZE
+            
+            if scan_index >= len(all_known_symbols):
+                scan_index = 0
+                print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 Completed full cycle. Restarting...\n")
+            
+            # Scan batch in parallel
+            tasks = [quick_scan_symbol(symbol) for symbol in batch]
+            results = await asyncio.gather(*tasks)
+            
+            # Process results
+            for i, result in enumerate(results):
                 if result:
                     symbol_name = result['symbol']
-                    # Update opportunities
                     latest_opportunities = [o for o in latest_opportunities if o['symbol'] != symbol_name]
                     latest_opportunities.append(result)
                     latest_opportunities.sort(key=lambda x: x['spread'], reverse=True)
@@ -237,23 +246,21 @@ async def continuous_scanner():
                         latest_opportunities = latest_opportunities[:50]
                     
                     print(f"  🎯 Found: {result['symbol']} - {result['spread']}% spread on {result['buy_exchange']} → {result['sell_exchange']}")
-                
-                # Status update every 30 seconds
-                if time.time() - last_status_time > 30:
-                    last_status_time = time.time()
-                    print(f"[{time.strftime('%H:%M:%S')}] 📊 Scanned {i+1}/{len(all_known_symbols)} | Active opportunities: {len(latest_opportunities)}")
-                    if latest_opportunities:
-                        best = latest_opportunities[0]
-                        print(f"    🎯 Best: {best['symbol']} - {best['spread']}% (net: {best['net_profit']}%)")
-                
-                # Small delay to avoid rate limits
-                await asyncio.sleep(0.1)
             
-            print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 Completed full scan cycle. Restarting...\n")
+            # Status update every 30 seconds
+            if time.time() - last_status_time > 30:
+                last_status_time = time.time()
+                scanned = min(scan_index, len(all_known_symbols))
+                print(f"[{time.strftime('%H:%M:%S')}] 📊 Scanned {scanned}/{len(all_known_symbols)} | Active opportunities: {len(latest_opportunities)}")
+                if latest_opportunities:
+                    best = latest_opportunities[0]
+                    print(f"    🎯 Best: {best['symbol']} - {best['spread']}% (net: {best['net_profit']}%)")
+            
+            await asyncio.sleep(0.1)
             
         except Exception as e:
             print(f"❌ Scanner error: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(1)
 
 # ============ WEB UI ============
 @app.on_event("startup")
@@ -355,7 +362,7 @@ if __name__ == "__main__":
     print(f"{'='*60}")
     print(f"📊 Min Profit: {MIN_PROFIT_PERCENT}% | Min Liquidity: ${MIN_LIQUIDITY_USD}")
     print(f"🔐 Mode: REAL EXCHANGES ONLY")
-    print(f"⚡ Scanning: Continuous")
+    print(f"⚡ Scanning: Continuous with safe fetching")
     print(f"🌐 Web UI: http://localhost:{port}")
     print(f"{'='*60}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)

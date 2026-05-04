@@ -16,7 +16,7 @@ API_KEYS = {
     'kucoin': {
         'apiKey': os.getenv('KUCOIN_API_KEY', ''),
         'secret': os.getenv('KUCOIN_SECRET', ''),
-        'password': os.getenv('KUCOIN_PASSPHRASE', ''),
+        'password': os.getenv('KUCOIN_PASSWORD', ''),
         'options': {'defaultType': 'spot', 'timeout': 30000}
     },
     'gateio': {
@@ -55,6 +55,7 @@ WITHDRAWAL_FEES = {
 MIN_PROFIT_PERCENT = 0.1
 MIN_LIQUIDITY_USD = 30
 BATCH_SIZE = 10
+MARKET_LOAD_TIMEOUT = 90  # Changed from 45 to 90 seconds
 
 # Initialize exchanges
 exchanges = {}
@@ -110,15 +111,15 @@ async def get_all_symbols():
         print("❌ Need at least 2 exchanges with valid API keys")
         return []
     
-    print("📊 Loading markets from exchanges (timeout: 45 seconds)...")
+    print(f"📊 Loading markets from exchanges (timeout: {MARKET_LOAD_TIMEOUT} seconds)...")
     
     try:
-        # Load markets with timeout
+        # Load markets with 90 second timeout
         tasks = [ex.load_markets() for ex in exchanges.values()]
-        await asyncio.wait_for(asyncio.gather(*tasks), timeout=45.0)
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=MARKET_LOAD_TIMEOUT)
         print("✓ Markets loaded successfully")
     except asyncio.TimeoutError:
-        print("❌ Market loading timed out after 45 seconds")
+        print(f"❌ Market loading timed out after {MARKET_LOAD_TIMEOUT} seconds")
         print("💡 Check your API keys and network connection")
         return []
     except Exception as e:
@@ -134,6 +135,7 @@ async def get_all_symbols():
         return []
     
     print(f"✓ Found {len(symbols)} common USDT pairs")
+    print(f"📈 Examples: {', '.join([s.replace('/USDT', '') for s in symbols[:15]])}")
     return symbols
 
 async def quick_scan_symbol(symbol):
@@ -155,7 +157,7 @@ async def quick_scan_symbol(symbol):
                 }
         
         if len(data) < 2:
-            return {'symbol': symbol.replace('/USDT', ''), 'is_active': False}
+            return None
         
         best_profit = 0
         best_opp = None
@@ -196,16 +198,11 @@ async def quick_scan_symbol(symbol):
                 'liquidity': round(liquidity, 0),
                 'buy_liquidity': round(b['ask_vol'], 0),
                 'sell_liquidity': round(s['bid_vol'], 0),
-                'timestamp': time.time(),
-                'is_active': True
+                'timestamp': time.time()
             }
-        
-        return {'symbol': symbol.replace('/USDT', ''), 'is_active': False}
-        
-    except asyncio.TimeoutError:
-        return {'symbol': symbol.replace('/USDT', ''), 'is_active': False}
-    except Exception as e:
-        return {'symbol': symbol.replace('/USDT', ''), 'is_active': False}
+        return None
+    except:
+        return None
 
 async def continuous_scanner():
     global latest_opportunities, all_known_symbols
@@ -215,12 +212,6 @@ async def continuous_scanner():
         print("❌ CANNOT START SCANNER")
         print("="*60)
         print("Need at least 2 exchanges with valid API keys.")
-        print("\nPlease add your API keys to Render environment variables:")
-        for name in API_KEYS.keys():
-            print(f"  - {name.upper()}_API_KEY")
-            print(f"  - {name.upper()}_SECRET")
-        if 'kucoin' in API_KEYS:
-            print(f"  - KUCOIN_PASSPHRASE")
         print("="*60)
         return
     
@@ -228,16 +219,16 @@ async def continuous_scanner():
     
     if len(all_known_symbols) == 0:
         print("❌ No common USDT pairs found across exchanges")
-        print("💡 Make sure all exchanges have USDT pairs in common")
         return
     
     print(f"\n{'='*60}")
     print(f"🔄 REAL EXCHANGE ARBITRAGE SCANNER ACTIVE")
     print(f"{'='*60}")
     print(f"📊 Connected exchanges: {', '.join(exchanges.keys())}")
-    print(f"📈 Total USDT pairs: {len(all_known_symbols)}")
+    print(f"📈 Total pairs to scan: {len(all_known_symbols)}")
     print(f"💰 Min profit: {MIN_PROFIT_PERCENT}% | Min liquidity: ${MIN_LIQUIDITY_USD}")
-    print(f"⚡ Mode: Continuous scanning (never stops)")
+    print(f"⏱️  Market timeout: {MARKET_LOAD_TIMEOUT} seconds")
+    print(f"⚡ Mode: Continuous scanning")
     print(f"{'='*60}\n")
     
     scan_index = 0
@@ -246,9 +237,7 @@ async def continuous_scanner():
         try:
             if scan_index >= len(all_known_symbols):
                 scan_index = 0
-                # Re-prioritize based on historical profits
-                all_known_symbols.sort(key=lambda s: -historical_profits.get(s, {}).get('last_profit', 0))
-                print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 Completed full cycle. Re-prioritizing...")
+                print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 Completed full cycle. Restarting...")
             
             batch = all_known_symbols[scan_index:scan_index + BATCH_SIZE]
             scan_index += BATCH_SIZE
@@ -257,34 +246,23 @@ async def continuous_scanner():
             results = await asyncio.gather(*tasks)
             
             for i, result in enumerate(results):
-                if not result:
-                    continue
-                    
-                symbol_name = batch[i].replace('/USDT', '')
-                
-                if result.get('is_active'):
-                    historical_profits[batch[i]] = {
-                        'last_profit': result['spread'],
-                        'last_seen': time.time()
-                    }
+                if result:
+                    symbol_name = batch[i].replace('/USDT', '')
+                    historical_profits[batch[i]] = {'last_profit': result['spread'], 'last_seen': time.time()}
                     latest_opportunities = [o for o in latest_opportunities if o['symbol'] != symbol_name]
                     latest_opportunities.append(result)
-                else:
-                    latest_opportunities = [o for o in latest_opportunities if o['symbol'] != symbol_name]
             
-            # Sort by profit and keep top 50
             latest_opportunities.sort(key=lambda x: x['spread'], reverse=True)
             if len(latest_opportunities) > 50:
                 latest_opportunities = latest_opportunities[:50]
             
-            # Print status every few batches
-            if scan_index % (BATCH_SIZE * 5) == 0 or scan_index <= BATCH_SIZE:
+            if scan_index % (BATCH_SIZE * 5) == 0:
                 scanned = min(scan_index, len(all_known_symbols))
-                print(f"[{time.strftime('%H:%M:%S')}] 📊 Scanned {scanned}/{len(all_known_symbols)} | Active: {len(latest_opportunities)}")
+                print(f"[{time.strftime('%H:%M:%S')}] 📊 Scanned {scanned}/{len(all_known_symbols)} | Active opportunities: {len(latest_opportunities)}")
                 
                 if latest_opportunities:
                     best = latest_opportunities[0]
-                    print(f"    🎯 Best: {best['symbol']} - {best['spread']}% spread (net: {best['net_profit']}%)")
+                    print(f"    🎯 Best: {best['symbol']} - {best['spread']}% spread (net: {best['net_profit']}%) on {best['buy_exchange']} → {best['sell_exchange']}")
             
             await asyncio.sleep(0.1)
             
@@ -338,6 +316,7 @@ async def get():
         .stats {
             display: flex;
             justify-content: space-between;
+            align-items: center;
             margin-bottom: 16px;
             font-size: 12px;
             color: #666;
@@ -398,10 +377,7 @@ async def get():
         .info-value { color: #fff; font-weight: 500; }
         .network-section { margin-top: 12px; padding-top: 8px; border-top: 1px solid #1e1e1e; }
         .network-title { font-size: 12px; color: #888; margin-bottom: 6px; }
-        .network-item { background: #1a1a1a; padding: 8px 12px; border-radius: 8px; margin-bottom: 6px; }
-        .network-name { color: #2ecc71; font-weight: 600; }
-        .fee-value { color: #f39c12; }
-        .network-list { font-size: 11px; color: #888; word-break: break-all; }
+        .network-list { font-size: 11px; color: #888; word-break: break-all; line-height: 1.5; }
         .button-group { display: flex; gap: 12px; margin: 16px 0; }
         .action-btn {
             flex: 1;
@@ -416,6 +392,7 @@ async def get():
             text-align: center;
             text-decoration: none;
             display: inline-block;
+            transition: all 0.2s;
         }
         .action-btn:hover { background: #f39c12; border-color: #f39c12; color: #0a0a0a; }
         .warning-box {
@@ -450,6 +427,13 @@ async def get():
             padding-top: 12px;
             border-top: 1px solid #1e1e1e;
         }
+        .recommended-box {
+            background: rgba(46, 204, 113, 0.1);
+            border-left: 3px solid #2ecc71;
+            padding: 10px;
+            border-radius: 8px;
+            margin-top: 12px;
+        }
     </style>
 </head>
 <body>
@@ -462,13 +446,12 @@ async def get():
             </div>
         </div>
         <div class="stats">
-            <span><span class="live-indicator"></span> REAL EXCHANGES</span>
+            <span><span class="live-indicator"></span> LIVE SCANNING</span>
             <span id="count">0 opportunities</span>
         </div>
         <div id="opportunities-container"></div>
         <div class="footer">
-            💰 Min profit: 0.1% | Min liquidity: $30 | Continuous scanning<br>
-            🌐 Shows ALL available networks | Auto-selects cheapest
+            💰 Min profit: 0.1% | Min liquidity: $30 | Shows ALL available networks
         </div>
     </div>
     <script>
@@ -478,50 +461,60 @@ async def get():
         
         function timeAgo(ts) {
             const s = Math.floor(Date.now()/1000 - ts);
-            if (s < 60) return `${s}s ago`;
-            return `${Math.floor(s/60)}m ago`;
+            if (s < 60) return `${s} seconds ago`;
+            if (s < 3600) return `${Math.floor(s/60)} minutes ago`;
+            return `${Math.floor(s/3600)} hours ago`;
         }
         
         function formatExchange(n) {
-            const names = {'GATEIO':'Gate.io','KUCOIN':'KuCoin','MEXC':'MEXC','BITGET':'Bitget','COINEX':'CoinEx'};
+            const names = {
+                'GATEIO': 'Gate.io',
+                'KUCOIN': 'KuCoin', 
+                'MEXC': 'MEXC',
+                'BITGET': 'Bitget',
+                'COINEX': 'CoinEx'
+            };
             return names[n] || n;
         }
         
-        function toggleDetail(id, e) {
-            e.stopPropagation();
-            const d = document.getElementById(`detail-${id}`);
+        function toggleDetail(id, event) {
+            event.stopPropagation();
+            const detail = document.getElementById(`detail-${id}`);
             if (expandedCard === id) {
-                d.classList.remove('show');
+                detail.classList.remove('show');
                 expandedCard = null;
             } else {
                 if (expandedCard !== null) {
-                    document.getElementById(`detail-${expandedCard}`).classList.remove('show');
+                    const prevDetail = document.getElementById(`detail-${expandedCard}`);
+                    if (prevDetail) prevDetail.classList.remove('show');
                 }
-                d.classList.add('show');
+                detail.classList.add('show');
                 expandedCard = id;
             }
         }
         
-        function getExchangeLink(ex, sym) {
-            const l = ex.toLowerCase();
-            if (l === 'mexc') return `https://www.mexc.com/exchange/${sym}_USDT`;
-            if (l === 'kucoin') return `https://www.kucoin.com/trade/${sym}-USDT`;
-            if (l === 'gateio') return `https://www.gate.io/trade/${sym}_USDT`;
-            if (l === 'bitget') return `https://www.bitget.com/spot/${sym}USDT`;
-            if (l === 'coinex') return `https://www.coinex.com/trading/${sym}USDT`;
+        function getExchangeLink(exchange, symbol) {
+            const ex = exchange.toLowerCase();
+            if (ex === 'mexc') return `https://www.mexc.com/exchange/${symbol}_USDT`;
+            if (ex === 'kucoin') return `https://www.kucoin.com/trade/${symbol}-USDT`;
+            if (ex === 'gateio') return `https://www.gate.io/trade/${symbol}_USDT`;
+            if (ex === 'bitget') return `https://www.bitget.com/spot/${symbol}USDT`;
+            if (ex === 'coinex') return `https://www.coinex.com/trading/${symbol}USDT`;
             return '#';
         }
         
         function updateDisplay() {
-            const c = document.getElementById('opportunities-container');
-            document.getElementById('count').textContent = allOpportunities.length + ' opportunities';
+            const container = document.getElementById('opportunities-container');
+            const countEl = document.getElementById('count');
+            
+            countEl.textContent = allOpportunities.length + ' opportunities';
             
             if (allOpportunities.length === 0) {
-                c.innerHTML = '<div class="no-data">🔍 Scanning real exchanges...<br><span style="font-size: 12px;">Looking for 0.1%+ opportunities with $30+ liquidity</span><br><span style="font-size: 11px; color: #444;">Checking ALL available networks for best fees</span></div>';
+                container.innerHTML = '<div class="no-data">🔍 Scanning for arbitrage opportunities...<br><span style="font-size: 12px;">Looking for 0.1%+ spreads with $30+ liquidity</span><br><span style="font-size: 11px; color: #444;">Real-time data from 5 exchanges</span></div>';
                 return;
             }
             
-            c.innerHTML = allOpportunities.map((opp, idx) => {
+            container.innerHTML = allOpportunities.map((opp, idx) => {
                 const buyLink = getExchangeLink(opp.buy_exchange, opp.symbol);
                 const sellLink = getExchangeLink(opp.sell_exchange, opp.symbol);
                 const ageSeconds = Math.floor(Date.now()/1000 - opp.timestamp);
@@ -551,7 +544,7 @@ async def get():
                     
                     <div class="detail-expanded" id="detail-${idx}">
                         <div class="trade-section">
-                            <div class="trade-title">1. Buy at ${formatExchange(opp.buy_exchange)}</div>
+                            <div class="trade-title">1️⃣ Buy at ${formatExchange(opp.buy_exchange)}</div>
                             <div class="info-row">
                                 <span class="info-label">Lowest Ask:</span>
                                 <span class="info-value">$${opp.buy_price}</span>
@@ -561,16 +554,16 @@ async def get():
                                 <span class="info-value">$${opp.buy_liquidity.toLocaleString()}</span>
                             </div>
                             <div class="network-section">
-                                <div class="network-title">📤 Active Withdrawal Networks &amp; Fees:</div>
+                                <div class="network-title">📤 Withdrawal Networks & Fees:</div>
                                 <div class="network-list">${opp.buy_networks}</div>
                             </div>
                             <div class="button-group">
-                                <a href="${buyLink}" target="_blank" class="action-btn" onclick="event.stopPropagation()">📊 CHECK ON ${formatExchange(opp.buy_exchange)}</a>
+                                <a href="${buyLink}" target="_blank" class="action-btn" onclick="event.stopPropagation()">📊 Go to ${formatExchange(opp.buy_exchange)}</a>
                             </div>
                         </div>
                         
                         <div class="trade-section">
-                            <div class="trade-title">2. Sell on ${formatExchange(opp.sell_exchange)}</div>
+                            <div class="trade-title">2️⃣ Sell at ${formatExchange(opp.sell_exchange)}</div>
                             <div class="info-row">
                                 <span class="info-label">Highest Bid:</span>
                                 <span class="info-value">$${opp.sell_price}</span>
@@ -580,20 +573,17 @@ async def get():
                                 <span class="info-value">$${opp.sell_liquidity.toLocaleString()}</span>
                             </div>
                             <div class="network-section">
-                                <div class="network-title">📥 Active Deposit Networks:</div>
+                                <div class="network-title">📥 Deposit Networks:</div>
                                 <div class="network-list">${opp.sell_networks}</div>
                             </div>
                             <div class="button-group">
-                                <a href="${sellLink}" target="_blank" class="action-btn" onclick="event.stopPropagation()">📊 CHECK ON ${formatExchange(opp.sell_exchange)}</a>
+                                <a href="${sellLink}" target="_blank" class="action-btn" onclick="event.stopPropagation()">📊 Go to ${formatExchange(opp.sell_exchange)}</a>
                             </div>
                         </div>
                         
-                        <div class="network-section" style="background: rgba(46,204,113,0.1); border-left: 3px solid #2ecc71;">
-                            <div class="network-title">✅ Recommended Network (Lowest Fee):</div>
-                            <div class="network-item">
-                                <span class="network-name">⭐ ${opp.recommended_network}</span>
-                                <span class="fee-value">Withdrawal: $${opp.withdrawal_fee}</span>
-                            </div>
+                        <div class="recommended-box">
+                            <div style="font-size: 12px; margin-bottom: 8px;">✅ RECOMMENDED NETWORK</div>
+                            <div><span style="color: #2ecc71; font-weight: 600;">${opp.recommended_network}</span> - Withdrawal fee: <span style="color: #f39c12;">$${opp.withdrawal_fee}</span></div>
                         </div>
                         
                         <div class="info-row" style="margin-top: 12px;">
@@ -606,12 +596,12 @@ async def get():
                         </div>
                         
                         <div class="warning-box">
-                            ⚠️ Double check coin's contract and name on both exchanges before initiating the trade.
+                            ⚠️ Double check coin contract and name before trading
                         </div>
                         
                         <div class="time-warning">
                             ${ageWarning}<br>
-                            Arbitrage opportunities are time-sensitive and typically last 10-15 minutes.
+                            Arbitrage opportunities typically last 10-15 minutes
                         </div>
                     </div>
                 </div>
@@ -620,12 +610,16 @@ async def get():
             expandedCard = null;
         }
         
-        ws.onmessage = (e) => {
-            allOpportunities = JSON.parse(e.data);
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            allOpportunities = data;
             updateDisplay();
         };
         
-        ws.onclose = () => setTimeout(() => location.reload(), 3000);
+        ws.onclose = () => {
+            console.log('WebSocket disconnected, reconnecting...');
+            setTimeout(() => location.reload(), 3000);
+        };
     </script>
 </body>
 </html>
@@ -639,19 +633,19 @@ async def websocket_endpoint(websocket: WebSocket):
         if latest_opportunities != last_sent:
             await websocket.send_json(latest_opportunities)
             last_sent = latest_opportunities.copy()
+            print(f"📤 WebSocket update: {len(latest_opportunities)} opportunities sent")
         await asyncio.sleep(2)
 
 if __name__ == "__main__":
-    port = int(os.getenv('PORT', 8000))
+    port = int(os.getenv('PORT', 10000))
     print(f"\n{'='*60}")
-    print(f"🚀 REAL EXCHANGE ARBITRAGE SCANNER")
+    print(f"🚀 ARBITRAGE SCANNER")
     print(f"{'='*60}")
-    print(f"📊 Settings:")
-    print(f"   - Min Profit: {MIN_PROFIT_PERCENT}%")
-    print(f"   - Min Liquidity: ${MIN_LIQUIDITY_USD}")
-    print(f"   - Networks: ALL available (auto-select cheapest)")
-    print(f"🔐 Mode: REAL EXCHANGE APIS (NO DEMO)")
-    print(f"⚡ Scanning: Continuous - never stops")
+    print(f"📊 Min Profit: {MIN_PROFIT_PERCENT}%")
+    print(f"💵 Min Liquidity: ${MIN_LIQUIDITY_USD}")
+    print(f"⏱️  Market Load Timeout: {MARKET_LOAD_TIMEOUT} seconds")
+    print(f"🔐 Mode: REAL EXCHANGE APIS")
+    print(f"⚡ Scanning: Continuous")
     print(f"🌐 Web UI: http://localhost:{port}")
     print(f"{'='*60}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)

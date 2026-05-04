@@ -11,45 +11,50 @@ import os
 API_KEYS = {
     'mexc': {
         'apiKey': os.getenv('MEXC_API_KEY', ''),
-        'secret': os.getenv('MEXC_SECRET', '')
+        'secret': os.getenv('MEXC_SECRET', ''),
+        'options': {'defaultType': 'spot'}  # Force spot market
     },
     'kucoin': {
         'apiKey': os.getenv('KUCOIN_API_KEY', ''),
         'secret': os.getenv('KUCOIN_SECRET', ''),
-        'password': os.getenv('KUCOIN_PASSPHRASE', '')
+        'password': os.getenv('KUCOIN_PASSPHRASE', ''),
+        'options': {'defaultType': 'spot'}  # Force spot market
     },
     'gateio': {
         'apiKey': os.getenv('GATEIO_API_KEY', ''),
-        'secret': os.getenv('GATEIO_SECRET', '')
+        'secret': os.getenv('GATEIO_SECRET', ''),
+        'options': {'defaultType': 'spot'}  # Force spot market
     },
     'bitget': {
         'apiKey': os.getenv('BITGET_API_KEY', ''),
-        'secret': os.getenv('BITGET_SECRET', '')
+        'secret': os.getenv('BITGET_SECRET', ''),
+        'options': {'defaultType': 'spot'}  # Force spot market
     },
     'coinex': {
         'apiKey': os.getenv('COINEX_API_KEY', ''),
-        'secret': os.getenv('COINEX_SECRET', '')
+        'secret': os.getenv('COINEX_SECRET', ''),
+        'options': {'defaultType': 'spot'}  # Force spot market
     },
 }
 
-MIN_PROFIT_PERCENT = 0.4
+MIN_PROFIT_PERCENT = 0.4  # Minimum profit after fees
 FEE_PERCENT = {
-    'mexc': 0.1, 
-    'kucoin': 0.1, 
-    'gateio': 0.1,
-    'bitget': 0.1,
-    'coinex': 0.2,
+    'mexc': 0.1,   # 0.1% trading fee
+    'kucoin': 0.1,  # 0.1% trading fee
+    'gateio': 0.1,  # 0.1% trading fee
+    'bitget': 0.1,  # 0.1% trading fee
+    'coinex': 0.2,  # 0.2% trading fee
 }
-MIN_LIQUIDITY_USD = 100
-SCAN_INTERVAL = 4
+MIN_LIQUIDITY_USD = 100  # Minimum liquidity in USD
+SCAN_INTERVAL = 4  # Scan every 4 seconds
 
-# Initialize exchanges (skip if no API keys)
+# Initialize exchanges
 exchanges = {}
 for name, keys in API_KEYS.items():
     if keys['apiKey'] and keys['secret']:
         try:
             exchanges[name] = getattr(ccxt, name)(keys)
-            print(f"✓ Initialized {name}")
+            print(f"✓ Initialized {name} (spot market)")
         except Exception as e:
             print(f"✗ Failed to initialize {name}: {e}")
     else:
@@ -60,43 +65,62 @@ latest_opportunities = []
 
 # ============ SCANNER LOGIC ============
 async def get_symbols():
+    """Get common spot USDT pairs across all exchanges"""
     if len(exchanges) < 2:
         print("⚠️ Need at least 2 exchanges to scan for arbitrage")
         return []
     
+    # Load all markets (spot only)
     await asyncio.gather(*[ex.load_markets() for ex in exchanges.values()])
+    
+    # Find common symbols across all exchanges
     common = set.intersection(*[set(ex.symbols) for ex in exchanges.values()])
+    
+    # ONLY keep USDT pairs (e.g., BTC/USDT, ETH/USDT, UNI/USDT)
+    # NO futures, NO perpetuals, NO other pairs
     symbols = [s for s in common if s.endswith('/USDT')]
-    print(f"✓ Found {len(symbols)} common USDT pairs")
+    
+    print(f"✓ Found {len(symbols)} common spot USDT pairs")
+    print(f"  Examples: {', '.join(symbols[:5])}...")
     return symbols
 
 async def scan_symbol(symbol):
+    """Scan a single trading pair for arbitrage opportunities"""
     try:
+        # Fetch order books from all exchanges simultaneously
         obs = await asyncio.gather(*[ex.fetch_order_book(symbol, limit=3) for ex in exchanges.values()])
         
+        # Extract best bid/ask prices
         data = {}
         for (name, ex), ob in zip(exchanges.items(), obs):
             if ob['asks'] and ob['bids']:
                 data[name] = {
-                    'ask': ob['asks'][0][0],
-                    'bid': ob['bids'][0][0],
-                    'ask_vol': ob['asks'][0][1] * ob['asks'][0][0],
-                    'bid_vol': ob['bids'][0][1] * ob['bids'][0][0]
+                    'ask': ob['asks'][0][0],  # Best ask price (what you buy at)
+                    'bid': ob['bids'][0][0],  # Best bid price (what you sell at)
+                    'ask_vol': ob['asks'][0][1] * ob['asks'][0][0],  # Ask liquidity in USD
+                    'bid_vol': ob['bids'][0][1] * ob['bids'][0][0],  # Bid liquidity in USD
                 }
         
+        # Find arbitrage opportunities
         opps = []
         for buy_ex, b in data.items():
             for sell_ex, s in data.items():
-                if buy_ex == sell_ex: continue
+                if buy_ex == sell_ex: continue  # Same exchange, no arbitrage
                 
+                # Calculate profit after fees
+                # Buy on exchange A: pay ask price + fee
                 buy_cost = b['ask'] * (1 + FEE_PERCENT.get(buy_ex, 0.1) / 100)
+                # Sell on exchange B: receive bid price - fee
                 sell_rev = s['bid'] * (1 - FEE_PERCENT.get(sell_ex, 0.1) / 100)
+                # Profit percentage
                 profit_pct = (sell_rev - buy_cost) / buy_cost * 100
+                # Available liquidity (limiting factor)
                 liquidity = min(b['ask_vol'], s['bid_vol'])
                 
+                # Check if profitable and liquid enough
                 if profit_pct > MIN_PROFIT_PERCENT and liquidity > MIN_LIQUIDITY_USD:
                     opps.append({
-                        'symbol': symbol,
+                        'symbol': symbol,  # e.g., "UNI/USDT"
                         'buy_exchange': buy_ex.upper(),
                         'sell_exchange': sell_ex.upper(),
                         'buy_price': b['ask'],
@@ -110,6 +134,7 @@ async def scan_symbol(symbol):
         return []
 
 async def scanner_loop():
+    """Main scanning loop - runs forever"""
     global latest_opportunities
     
     if len(exchanges) < 2:
@@ -117,20 +142,31 @@ async def scanner_loop():
         return
     
     symbols = await get_symbols()
-    print(f"🔄 Starting arbitrage scanner with {len(exchanges)} exchanges...")
-    print(f"📊 Scanning {len(symbols)} pairs every {SCAN_INTERVAL} seconds")
+    print(f"\n🔄 Starting arbitrage scanner...")
+    print(f"📊 Exchanges: {', '.join(exchanges.keys())}")
+    print(f"📈 Pairs to scan: {len(symbols)} spot USDT pairs")
+    print(f"⏱️  Scan interval: {SCAN_INTERVAL} seconds")
+    print(f"💰 Min profit: {MIN_PROFIT_PERCENT}%")
+    print(f"💵 Min liquidity: ${MIN_LIQUIDITY_USD}\n")
     
     while True:
         start_time = time.time()
+        
+        # Scan all symbols in parallel
         results = await asyncio.gather(*[scan_symbol(s) for s in symbols])
         opps = [opp for sublist in results for opp in sublist]
+        
+        # Sort by profit and keep top 50
         latest_opportunities = sorted(opps, key=lambda x: x['profit'], reverse=True)[:50]
         
+        # Print status
         if latest_opportunities:
-            print(f"✅ Found {len(latest_opportunities)} opportunities - Best: {latest_opportunities[0]['profit']}%")
+            best = latest_opportunities[0]
+            print(f"✅ [{time.strftime('%H:%M:%S')}] Found {len(latest_opportunities)} opportunities - Best: {best['symbol']} {best['profit']}%")
         else:
-            print(f"🔍 Scan complete - No opportunities found (checked {len(symbols)} pairs)")
+            print(f"🔍 [{time.strftime('%H:%M:%S')}] Scan complete - No opportunities found on {len(symbols)} spot USDT pairs")
         
+        # Wait for next scan
         elapsed = time.time() - start_time
         await asyncio.sleep(max(0, SCAN_INTERVAL - elapsed))
 
@@ -169,6 +205,16 @@ async def get():
             font-size: 36px;
             color: #fff;
             margin-bottom: 10px;
+        }
+        .badge {
+            display: inline-block;
+            background: #f39c12;
+            color: #0a0a0a;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-top: 5px;
         }
         .stats {
             text-align: center;
@@ -364,6 +410,14 @@ async def get():
             border: 1px solid #2a2a2a;
         }
         
+        .info-text {
+            text-align: center;
+            color: #666;
+            font-size: 12px;
+            margin-top: 20px;
+            padding: 10px;
+        }
+        
         @media (max-width: 768px) {
             body { padding: 15px; }
             .header h1 { font-size: 28px; }
@@ -377,6 +431,7 @@ async def get():
     <div class="container">
         <div class="header">
             <h1>🚀 Cross-Exchange Arbitrage Scanner</h1>
+            <div class="badge">📊 SPOT MARKET | ONLY USDT PAIRS</div>
             <div class="stats">
                 MEXC | KuCoin | Gate.io | Bitget | CoinEx
                 | <span id="count">0</span> opportunities
@@ -395,7 +450,7 @@ async def get():
                 </div>
                 <div class="filter-item">
                     <label>🔍 Symbol Filter</label>
-                    <input type="text" id="symbolFilter" placeholder="BTC, ETH, GHX">
+                    <input type="text" id="symbolFilter" placeholder="UNI, BTC, ETH">
                 </div>
             </div>
             
@@ -414,6 +469,9 @@ async def get():
         </div>
         
         <div class="opportunities" id="opps"></div>
+        <div class="info-text">
+            ⚡ Scanning spot markets only (USDT pairs) | Fees included | Updates every 4 seconds
+        </div>
     </div>
 
     <script>
@@ -471,7 +529,7 @@ async def get():
             document.getElementById('count').textContent = filtered.length;
             
             if (filtered.length === 0) {
-                container.innerHTML = '<div class="no-data">🔍 No arbitrage opportunities found<br><span style="font-size: 14px;">Try lowering the minimum profit or waiting for next scan</span></div>';
+                container.innerHTML = '<div class="no-data">🔍 No arbitrage opportunities found<br><span style="font-size: 14px;">Scanning spot USDT pairs across 5 exchanges...</span></div>';
                 return;
             }
             
@@ -558,5 +616,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 8000))
-    print(f"Starting Arbitrage Scanner Dashboard on port {port}...")
+    print(f"\n{'='*50}")
+    print(f"🚀 ARBITRAGE SCANNER STARTING")
+    print(f"{'='*50}")
+    print(f"📊 Market: SPOT only")
+    print(f"💰 Pairs: * / USDT only")
+    print(f"🏦 Exchanges: {', '.join(exchanges.keys())}")
+    print(f"🌐 Web UI: http://localhost:{port}")
+    print(f"{'='*50}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)

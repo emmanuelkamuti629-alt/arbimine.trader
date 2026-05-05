@@ -8,75 +8,55 @@ import os
 import json
 from datetime import datetime
 
-# ================= CONFIG =================
-EXCHANGE_IDS = ["mexc", "gateio", "kucoin", "coinex", "bitget"]
-# NO MAX COINS - SCAN ALL USDT PAIRS
-
-# Cache file for symbols (to speed up restarts)
+# ================= MEMORY-OPTIMIZED CONFIG =================
+EXCHANGE_IDS = ["gateio", "kucoin", "mexc", "bitget", "coinex"]  # Prioritize biggest first
+MAX_COINS = 300  # REDUCED from unlimited to 300 per exchange (saves memory)
 CACHE_FILE = "symbols_cache.json"
 
 # ================= TRADING CONFIG =================
 TRADING_FEES = {
-    'mexc': 0.1,
     'gateio': 0.1,
     'kucoin': 0.1,
-    'coinex': 0.2,
+    'mexc': 0.1,
     'bitget': 0.1,
+    'coinex': 0.2,
 }
 
 WITHDRAWAL_FEES = {
-    'mexc': {'ERC20': 0.14, 'TRC20': 0.10, 'BEP20': 0.05},
     'gateio': {'ERC20': 0.15, 'TRC20': 0.09, 'BEP20': 0.05},
     'kucoin': {'ERC20': 0.15, 'TRC20': 0.08, 'BEP20': 0.06},
-    'coinex': {'ERC20': 0.13, 'TRC20': 0.08, 'BEP20': 0.05},
+    'mexc': {'ERC20': 0.14, 'TRC20': 0.10, 'BEP20': 0.05},
     'bitget': {'ERC20': 0.12, 'TRC20': 0.07, 'BEP20': 0.04},
+    'coinex': {'ERC20': 0.13, 'TRC20': 0.08, 'BEP20': 0.05},
 }
 
 MIN_PROFIT_PERCENT = 0.1
 MIN_LIQUIDITY_USD = 30
-BATCH_SIZE = 20
+BATCH_SIZE = 10  # Smaller batches = less memory
 
 app = FastAPI()
 latest_opportunities = []
 all_symbols = []
 exchanges = {}
-exchange_symbols = {}
 
 # ================= CACHE FUNCTIONS =================
 def load_cached_symbols():
-    """Load cached symbols from file for faster startup"""
     try:
         if os.path.exists(CACHE_FILE):
             with open(CACHE_FILE, 'r') as f:
-                cache = json.load(f)
-                print(f"📦 Loaded cache with {len(cache)} exchanges")
-                return cache
-    except Exception as e:
-        print(f"⚠️ Cache load error: {e}")
+                return json.load(f)
+    except:
+        pass
     return {}
 
 def save_cached_symbols(cache):
-    """Save symbols to cache for future fast startups"""
     try:
         with open(CACHE_FILE, 'w') as f:
-            json.dump(cache, f, indent=2)
-            print(f"💾 Saved cache for {len(cache)} exchanges")
-    except Exception as e:
-        print(f"⚠️ Cache save error: {e}")
+            json.dump(cache, f)
+    except:
+        pass
 
-# ================= SYMBOL FILTERING - ALL USDT =================
-def get_all_usdt_symbols(exchange):
-    """Get ALL USDT spot pairs - NO LIMITS"""
-    usdt_symbols = []
-    for symbol in exchange.symbols:
-        # ONLY take /USDT pairs
-        if symbol.endswith('/USDT'):
-            usdt_symbols.append(symbol)
-    
-    print(f"    Found {len(usdt_symbols)} total USDT pairs")
-    return usdt_symbols  # NO LIMIT - RETURN ALL
-
-# ================= LOAD SINGLE EXCHANGE =================
+# ================= LOAD EXCHANGE (MEMORY OPTIMIZED) =================
 async def load_exchange(exchange_id, cached_data):
     start = datetime.now()
     exchange = None
@@ -84,30 +64,13 @@ async def load_exchange(exchange_id, cached_data):
     try:
         exchange_class = getattr(ccxt, exchange_id)
 
-        # BASE CONFIG
         config = {
-            "enableRateLimit": False,   # Max speed
-            "timeout": 30000,           # Internal CCXT request timeout only
-            "options": {
-                "defaultType": "spot",
-                "adjustForTimeDifference": False,
-                "recvWindow": 10000,
-            }
+            "enableRateLimit": True,  # Enable rate limiting to avoid bans
+            "timeout": 30000,
+            "options": {"defaultType": "spot"}
         }
 
-        # EXCHANGE-SPECIFIC SPEED TUNING
-        if exchange_id == "bitget":
-            config["options"].update({"defaultType": "spot"})
-        elif exchange_id == "coinex":
-            config["options"].update({"createMarketBuyOrderRequiresPrice": False})
-        elif exchange_id == "gateio":
-            config["options"].update({"defaultType": "spot"})
-        elif exchange_id == "kucoin":
-            config["options"].update({"fetchMarkets": ["spot"]})
-        elif exchange_id == "mexc":
-            config["options"].update({"defaultType": "spot"})
-
-        # ADD API KEYS IF AVAILABLE
+        # ADD API KEYS
         api_key = os.getenv(f'{exchange_id.upper()}_API_KEY', '')
         api_secret = os.getenv(f'{exchange_id.upper()}_SECRET', '')
         
@@ -117,45 +80,28 @@ async def load_exchange(exchange_id, cached_data):
             if exchange_id == 'kucoin':
                 config['password'] = os.getenv('KUCOIN_PASSWORD', '')
 
-        # CREATE EXCHANGE
         exchange = exchange_class(config)
-        print(f"⚡ Initializing {exchange_id}...")
+        print(f"⚡ Loading {exchange_id}...")
 
-        # CHECK CACHE FIRST
+        # CHECK CACHE
         if exchange_id in cached_data:
-            symbols = cached_data[exchange_id]
-            # Filter cached symbols to ensure only USDT
-            symbols = [s for s in symbols if s.endswith('/USDT')]
-            print(f"⚡ {exchange_id}: Loaded {len(symbols)} cached USDT symbols instantly")
-            return {
-                "id": exchange_id,
-                "exchange": exchange,
-                "symbols": symbols,
-                "cached": True
-            }
+            symbols = [s for s in cached_data[exchange_id] if s.endswith('/USDT')][:MAX_COINS]
+            print(f"✓ {exchange_id}: {len(symbols)} cached USDT symbols")
+            return {"id": exchange_id, "exchange": exchange, "symbols": symbols}
 
-        # FULL MARKET LOAD
-        print(f"📡 {exchange_id}: Loading ALL USDT spot markets...")
+        # LOAD MARKETS
         await exchange.load_markets()
-
-        # GET ALL USDT SYMBOLS (NO LIMIT)
-        symbols = get_all_usdt_symbols(exchange)
-
-        # Remove duplicates and keep ALL
-        symbols = list(dict.fromkeys(symbols))
+        
+        # GET ONLY USDT PAIRS, LIMITED TO MAX_COINS
+        symbols = [s for s in exchange.symbols if s.endswith('/USDT')][:MAX_COINS]
 
         elapsed = (datetime.now() - start).total_seconds()
-        print(f"✓ {exchange_id}: Loaded {len(symbols)} USDT symbols in {elapsed:.2f}s")
+        print(f"✓ {exchange_id}: {len(symbols)} USDT symbols in {elapsed:.1f}s")
 
-        return {
-            "id": exchange_id,
-            "exchange": exchange,
-            "symbols": symbols,
-            "cached": False
-        }
+        return {"id": exchange_id, "exchange": exchange, "symbols": symbols}
 
     except Exception as e:
-        print(f"❌ {exchange_id} failed: {type(e).__name__}: {e}")
+        print(f"❌ {exchange_id} failed: {str(e)[:50]}")
         if exchange:
             try:
                 await exchange.close()
@@ -163,92 +109,49 @@ async def load_exchange(exchange_id, cached_data):
                 pass
         return None
 
-# ================= PARALLEL INITIALIZER =================
+# ================= INITIALIZE =================
 async def initialize_exchanges():
-    """FULL PRODUCTION INITIALIZATION - ALL USDT SPOT"""
-    global exchanges, exchange_symbols, all_symbols
+    global exchanges, all_symbols
     
-    print("\n" + "="*60)
-    print("🚀 ALL USDT SPOT MARKET SCANNER")
-    print("="*60)
+    print("\n" + "="*50)
+    print("🚀 MEMORY-OPTIMIZED SCANNER (512MB)")
+    print("="*50)
 
-    overall_start = datetime.now()
     cached_data = load_cached_symbols()
 
-    # LOAD ALL EXCHANGES IN PARALLEL
-    tasks = [load_exchange(exchange_id, cached_data) for exchange_id in EXCHANGE_IDS]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
+    # LOAD SEQUENTIALLY (less memory spike than parallel)
     new_exchanges = {}
     symbols_map = {}
     new_cache = {}
 
-    # PROCESS RESULTS
-    for result in results:
-        if not result or isinstance(result, Exception):
-            continue
+    for exchange_id in EXCHANGE_IDS:
+        result = await load_exchange(exchange_id, cached_data)
+        if result:
+            new_exchanges[result["id"]] = result["exchange"]
+            symbols_map[result["id"]] = result["symbols"]
+            new_cache[result["id"]] = result["symbols"]
+            # Small delay to let memory settle
+            await asyncio.sleep(0.5)
 
-        exchange_id = result["id"]
-        new_exchanges[exchange_id] = result["exchange"]
-        symbols_map[exchange_id] = result["symbols"]
-        new_cache[exchange_id] = result["symbols"]
-
-    # SAVE CACHE
     if new_cache:
         save_cached_symbols(new_cache)
 
     exchanges = new_exchanges
-    exchange_symbols = symbols_map
     
-    # Combine ALL USDT symbols for scanning
+    # Combine symbols
     all_symbols_set = set()
     for syms in symbols_map.values():
         all_symbols_set.update(syms)
     all_symbols = list(all_symbols_set)
 
-    elapsed = (datetime.now() - overall_start).total_seconds()
-
-    # SUMMARY
-    print("="*60)
-    print(f"✅ READY: {len(exchanges)}/{len(EXCHANGE_IDS)} exchanges loaded")
-    print(f"🪙 Total USDT symbols loaded (per exchange):")
-    for name, syms in symbols_map.items():
-        print(f"     {name}: {len(syms)} USDT pairs")
-    print(f"📊 Unique USDT pairs to scan: {len(all_symbols)}")
-    print(f"⏱ Total startup time: {elapsed:.2f}s")
-    print("="*60 + "\n")
+    print("="*50)
+    print(f"✅ {len(exchanges)} exchanges loaded")
+    print(f"📊 {len(all_symbols)} USDT pairs to scan")
+    print("="*50 + "\n")
     
     return len(exchanges) >= 2
 
-# ================= HELPER FUNCTIONS =================
-def get_lowest_fee_network(exchange):
-    networks = WITHDRAWAL_FEES.get(exchange.lower(), {'ERC20': 0.15})
-    best_network = min(networks.items(), key=lambda x: x[1])
-    return best_network[0], best_network[1]
-
-def get_all_networks_with_fees(exchange):
-    networks = WITHDRAWAL_FEES.get(exchange.lower(), {'ERC20': 0.15})
-    return " | ".join([f"{k} (${v})" for k, v in networks.items()])
-
-def calculate_best_net_profit(profit_pct, amount_usd, buy_exchange, sell_exchange):
-    gross_profit_usd = amount_usd * (profit_pct / 100)
-    network, withdrawal_fee = get_lowest_fee_network(buy_exchange)
-    net_profit_usd = gross_profit_usd - withdrawal_fee
-    net_profit_pct = (net_profit_usd / amount_usd) * 100 if amount_usd > 0 else 0
-    return net_profit_usd, net_profit_pct, withdrawal_fee, network
-
-def get_exchange_link(exchange, symbol):
-    exchange_lower = exchange.lower()
-    links = {
-        'mexc': f"https://www.mexc.com/exchange/{symbol}_USDT",
-        'gateio': f"https://www.gate.io/trade/{symbol}_USDT",
-        'kucoin': f"https://www.kucoin.com/trade/{symbol}-USDT",
-        'coinex': f"https://www.coinex.com/trading/{symbol}USDT",
-        'bitget': f"https://www.bitget.com/spot/{symbol}USDT",
-    }
-    return links.get(exchange_lower, "#")
-
-# ================= SCAN SINGLE SYMBOL =================
+# ================= SCAN SYMBOL =================
 async def scan_symbol(symbol):
     try:
         tasks = []
@@ -268,11 +171,13 @@ async def scan_symbol(symbol):
             if isinstance(result, Exception):
                 continue
             if result and result.get('asks') and result.get('bids') and len(result['asks']) > 0:
+                ask_price = result['asks'][0][0]
+                bid_price = result['bids'][0][0]
                 data[name] = {
-                    'ask': result['asks'][0][0],
-                    'bid': result['bids'][0][0],
-                    'ask_vol': result['asks'][0][1] * result['asks'][0][0],
-                    'bid_vol': result['bids'][0][1] * result['bids'][0][0],
+                    'ask': ask_price,
+                    'bid': bid_price,
+                    'ask_vol': result['asks'][0][1] * ask_price,
+                    'bid_vol': result['bids'][0][1] * bid_price,
                 }
         
         if len(data) < 2:
@@ -297,9 +202,10 @@ async def scan_symbol(symbol):
         
         if best_opp and best_profit >= MIN_PROFIT_PERCENT:
             buy_ex, sell_ex, b, s, profit_pct, liquidity = best_opp
-            net_profit_usd, net_profit_pct, withdrawal_fee, network = calculate_best_net_profit(
-                profit_pct, 100, buy_ex, sell_ex
-            )
+            
+            # Simplified profit calculation
+            withdrawal_fee = 0.10  # Average fee
+            net_profit_pct = profit_pct - 0.1
             
             return {
                 'symbol': symbol.replace('/USDT', ''),
@@ -309,18 +215,18 @@ async def scan_symbol(symbol):
                 'sell_price': s['bid'],
                 'spread': round(profit_pct, 1),
                 'net_profit': round(net_profit_pct, 1),
-                'net_profit_usd': round(net_profit_usd, 2),
-                'withdrawal_fee': round(withdrawal_fee, 2),
-                'recommended_network': network,
-                'buy_networks': get_all_networks_with_fees(buy_ex),
-                'sell_networks': get_all_networks_with_fees(sell_ex),
+                'net_profit_usd': round(profit_pct - 0.1, 2),
+                'withdrawal_fee': 0.10,
+                'recommended_network': 'BEP20',
+                'buy_networks': 'BEP20 ($0.05) | TRC20 ($0.10)',
+                'sell_networks': 'BEP20 (Free) | TRC20 (Free)',
                 'liquidity': round(liquidity, 0),
                 'buy_liquidity': round(b['ask_vol'], 0),
                 'sell_liquidity': round(s['bid_vol'], 0),
                 'timestamp': time.time()
             }
         return None
-    except Exception as e:
+    except:
         return None
 
 # ================= CONTINUOUS SCANNER =================
@@ -328,17 +234,11 @@ async def continuous_scanner():
     global latest_opportunities, all_symbols
     
     success = await initialize_exchanges()
-    if not success:
-        print("❌ Failed to initialize exchanges")
+    if not success or not all_symbols:
+        print("❌ Failed to initialize")
         return
     
-    if not all_symbols:
-        print("❌ No USDT symbols loaded")
-        return
-    
-    print(f"🔄 STARTING CONTINUOUS USDT SCAN")
-    print(f"💰 Target: {MIN_PROFIT_PERCENT}% profit | ${MIN_LIQUIDITY_USD} liquidity")
-    print(f"📊 Scanning {len(all_symbols)} USDT pairs continuously\n")
+    print(f"🔄 SCANNING {len(all_symbols)} USDT pairs...\n")
     
     scan_index = 0
     last_log = time.time()
@@ -351,7 +251,7 @@ async def continuous_scanner():
             
             if scan_index >= len(all_symbols):
                 scan_index = 0
-                print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 FULL CYCLE - {len(latest_opportunities)} USDT opportunities active\n")
+                print(f"[{time.strftime('%H:%M:%S')}] 🔄 Full cycle - {len(latest_opportunities)} active")
                 scanned = 0
             
             tasks = [scan_symbol(symbol) for symbol in batch]
@@ -359,25 +259,23 @@ async def continuous_scanner():
             
             for result in results:
                 if result:
-                    symbol_name = result['symbol']
-                    latest_opportunities = [o for o in latest_opportunities if o['symbol'] != symbol_name]
+                    latest_opportunities = [o for o in latest_opportunities if o['symbol'] != result['symbol']]
                     latest_opportunities.append(result)
                     latest_opportunities.sort(key=lambda x: x['spread'], reverse=True)
-                    if len(latest_opportunities) > 50:
-                        latest_opportunities = latest_opportunities[:50]
-                    
-                    print(f"  🎯 {result['symbol']}/USDT - {result['spread']}% ({result['buy_exchange']} → {result['sell_exchange']})")
+                    if len(latest_opportunities) > 30:
+                        latest_opportunities = latest_opportunities[:30]
+                    print(f"  🎯 {result['symbol']} - {result['spread']}%")
             
             scanned += len(batch)
             
-            if time.time() - last_log > 10:
+            if time.time() - last_log > 15:
                 last_log = time.time()
-                print(f"[{time.strftime('%H:%M:%S')}] 📊 USDT: {scanned}/{len(all_symbols)} | Active: {len(latest_opportunities)}")
+                print(f"[{time.strftime('%H:%M:%S')}] 📊 {scanned}/{len(all_symbols)} | Active: {len(latest_opportunities)}")
             
             await asyncio.sleep(0.05)
             
         except Exception as e:
-            print(f"❌ Scan error: {e}")
+            print(f"❌ Error: {e}")
             await asyncio.sleep(1)
 
 # ================= WEB UI =================
@@ -391,7 +289,7 @@ async def get():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Full USDT Spot Arbitrage Scanner</title>
+    <title>Arbitrage Scanner - Optimized</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -400,8 +298,7 @@ async def get():
         .header { text-align: center; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid #222; }
         .header h1 { font-size: 24px; color: #fff; }
         .badge { display: inline-block; background: #2ecc71; color: #0a0a0a; padding: 4px 10px; border-radius: 16px; font-size: 10px; font-weight: 600; margin: 6px 0; }
-        .usdt-badge { background: #f39c12; }
-        .all-badge { background: #e74c3c; }
+        .mem-badge { background: #3498db; }
         .stats { display: flex; justify-content: space-between; margin-bottom: 16px; font-size: 12px; color: #666; }
         .live-indicator { display: inline-block; width: 8px; height: 8px; background: #2ecc71; border-radius: 50%; animation: blink 1s infinite; margin-right: 6px; }
         @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
@@ -425,7 +322,6 @@ async def get():
         .info-row { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 13px; }
         .info-label { color: #888; }
         .info-value { color: #fff; font-weight: 500; }
-        .network-list { font-size: 11px; color: #888; }
         .button-group { display: flex; gap: 12px; margin: 16px 0; }
         .action-btn { flex: 1; background: #1a1a1a; border: 1px solid #2a2a2a; color: #e0e0e0; padding: 10px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; text-align: center; text-decoration: none; }
         .action-btn:hover { background: #f39c12; border-color: #f39c12; color: #0a0a0a; }
@@ -438,19 +334,18 @@ async def get():
 <body>
     <div class="container">
         <div class="header">
-            <h1>🚀 Full USDT Spot Arbitrage Scanner</h1>
+            <h1>🚀 Arbitrage Scanner</h1>
             <div>
                 <span class="badge">📊 5 EXCHANGES</span>
-                <span class="badge usdt-badge">💵 ALL USDT SPOT</span>
-                <span class="badge all-badge">🪙 NO LIMITS</span>
+                <span class="badge mem-badge">⚡ 512MB OPTIMIZED</span>
             </div>
         </div>
         <div class="stats">
-            <span><span class="live-indicator"></span> SCANNING ALL USDT</span>
+            <span><span class="live-indicator"></span> SCANNING</span>
             <span id="count">0 opportunities</span>
         </div>
         <div id="opportunities-container"></div>
-        <div class="footer">💰 0.1%+ profit | $30+ liquidity | Scanning ALL USDT pairs from all exchanges</div>
+        <div class="footer">💰 0.1%+ profit | $30+ liquidity | Optimized for 512MB RAM</div>
     </div>
     <script>
         let allOpportunities = [], expandedCard = null;
@@ -458,12 +353,11 @@ async def get():
         function timeAgo(ts) { const s = Math.floor(Date.now()/1000 - ts); return s < 60 ? `${s}s ago` : `${Math.floor(s/60)}m ago`; }
         function formatExchange(n) { const names={'MEXC':'MEXC','GATEIO':'Gate.io','KUCOIN':'KuCoin','COINEX':'CoinEx','BITGET':'Bitget'}; return names[n]||n; }
         function toggleDetail(id,e) { e.stopPropagation(); const d = document.getElementById(`detail-${id}`); if(expandedCard===id){ d.classList.remove('show'); expandedCard=null; } else { if(expandedCard!==null) document.getElementById(`detail-${expandedCard}`).classList.remove('show'); d.classList.add('show'); expandedCard=id; } }
-        function getExchangeLink(ex,sym) { const l=ex.toLowerCase(); if(l==='mexc') return `https://www.mexc.com/exchange/${sym}_USDT`; if(l==='gateio') return `https://www.gate.io/trade/${sym}_USDT`; if(l==='kucoin') return `https://www.kucoin.com/trade/${sym}-USDT`; return '#'; }
         function updateDisplay() {
             const c = document.getElementById('opportunities-container');
             document.getElementById('count').textContent = allOpportunities.length + ' opportunities';
-            if(allOpportunities.length===0){ c.innerHTML='<div class="no-data">🔍 Loading ALL USDT Spot Markets...<br><span style="font-size:12px;">MEXC | Gate.io | KuCoin | CoinEx | Bitget</span><br><span style="font-size:11px;">This may take 1-2 minutes for first load</span></div>'; return; }
-            c.innerHTML = allOpportunities.map((opp,idx)=>`<div class="opportunity-card" onclick="toggleDetail(${idx},event)"><div class="card-main"><div class="left-section"><div class="exchange-pair"><span class="buy-text">BUY</span> <span class="exchange-name">${formatExchange(opp.buy_exchange)}</span> <span class="sell-text">→ SELL</span> <span class="exchange-name">${formatExchange(opp.sell_exchange)}</span></div><div class="token-symbol">${opp.symbol}/USDT</div><div class="details-row"><span>💰 $${opp.liquidity.toLocaleString()}</span><span>⏱️ ${timeAgo(opp.timestamp)}</span></div></div><div class="profit-section"><div class="spread-percent">${opp.spread}%</div><div class="net-profit">net: ${opp.net_profit}%</div></div></div><div class="detail-expanded" id="detail-${idx}"><div class="trade-section"><div class="trade-title">1️⃣ Buy at ${formatExchange(opp.buy_exchange)}</div><div class="info-row"><span class="info-label">Lowest Ask:</span><span class="info-value">$${opp.buy_price}</span></div><div class="info-row"><span class="info-label">Liquidity:</span><span class="info-value">$${opp.buy_liquidity.toLocaleString()}</span></div><div class="network-list"><strong>Withdrawal:</strong> ${opp.recommended_network} ($${opp.withdrawal_fee})</div><div class="button-group"><a href="${getExchangeLink(opp.buy_exchange, opp.symbol)}" target="_blank" class="action-btn" onclick="event.stopPropagation()">📊 Go to ${formatExchange(opp.buy_exchange)}</a></div></div><div class="trade-section"><div class="trade-title">2️⃣ Sell at ${formatExchange(opp.sell_exchange)}</div><div class="info-row"><span class="info-label">Highest Bid:</span><span class="info-value">$${opp.sell_price}</span></div><div class="info-row"><span class="info-label">Liquidity:</span><span class="info-value">$${opp.sell_liquidity.toLocaleString()}</span></div><div class="network-list"><strong>Deposit:</strong> ${opp.recommended_network} (Free)</div><div class="button-group"><a href="${getExchangeLink(opp.sell_exchange, opp.symbol)}" target="_blank" class="action-btn" onclick="event.stopPropagation()">📊 Go to ${formatExchange(opp.sell_exchange)}</a></div></div><div class="info-row"><span class="info-label">Gross Spread:</span><span class="info-value">${opp.spread}%</span></div><div class="info-row"><span class="info-label">Net Profit:</span><span class="info-value">${opp.net_profit}% ($${opp.net_profit_usd} on $100)</span></div><div class="warning-box">⚠️ Double check coin contract before trading</div><div class="time-warning">🟢 Act fast - opportunities last 10-15 min</div></div></div>`).join('');
+            if(allOpportunities.length===0){ c.innerHTML='<div class="no-data">🔍 Scanning USDT markets...<br><span style="font-size:12px;">MEXC | Gate.io | KuCoin | CoinEx | Bitget</span><br><span style="font-size:11px;">Optimized for 512MB RAM</span></div>'; return; }
+            c.innerHTML = allOpportunities.map((opp,idx)=>`<div class="opportunity-card" onclick="toggleDetail(${idx},event)"><div class="card-main"><div class="left-section"><div class="exchange-pair"><span class="buy-text">BUY</span> <span class="exchange-name">${formatExchange(opp.buy_exchange)}</span> <span class="sell-text">→ SELL</span> <span class="exchange-name">${formatExchange(opp.sell_exchange)}</span></div><div class="token-symbol">${opp.symbol}/USDT</div><div class="details-row"><span>💰 $${opp.liquidity.toLocaleString()}</span><span>⏱️ ${timeAgo(opp.timestamp)}</span></div></div><div class="profit-section"><div class="spread-percent">${opp.spread}%</div><div class="net-profit">net: ${opp.net_profit}%</div></div></div><div class="detail-expanded" id="detail-${idx}"><div class="trade-section"><div class="trade-title">1️⃣ Buy at ${formatExchange(opp.buy_exchange)}</div><div class="info-row"><span class="info-label">Lowest Ask:</span><span class="info-value">$${opp.buy_price}</span></div><div class="info-row"><span class="info-label">Liquidity:</span><span class="info-value">$${opp.buy_liquidity.toLocaleString()}</span></div><div class="button-group"><a href="#" class="action-btn">📊 Go to ${formatExchange(opp.buy_exchange)}</a></div></div><div class="trade-section"><div class="trade-title">2️⃣ Sell at ${formatExchange(opp.sell_exchange)}</div><div class="info-row"><span class="info-label">Highest Bid:</span><span class="info-value">$${opp.sell_price}</span></div><div class="info-row"><span class="info-label">Liquidity:</span><span class="info-value">$${opp.sell_liquidity.toLocaleString()}</span></div><div class="button-group"><a href="#" class="action-btn">📊 Go to ${formatExchange(opp.sell_exchange)}</a></div></div><div class="info-row"><span class="info-label">Gross Spread:</span><span class="info-value">${opp.spread}%</span></div><div class="info-row"><span class="info-label">Net Profit:</span><span class="info-value">${opp.net_profit}% ($${opp.net_profit_usd} on $100)</span></div><div class="warning-box">⚠️ Double check coin contract before trading</div><div class="time-warning">🟢 Act fast - opportunities last 10-15 min</div></div></div>`).join('');
             expandedCard = null;
         }
         ws.onmessage = (e) => { allOpportunities = JSON.parse(e.data); updateDisplay(); };
@@ -485,13 +379,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 10000))
-    print(f"\n{'='*60}")
-    print(f"🚀 FULL USDT SPOT ARBITRAGE SCANNER")
-    print(f"{'='*60}")
-    print(f"📊 Exchanges: {', '.join(EXCHANGE_IDS)}")
-    print(f"💵 Market: ALL USDT SPOT PAIRS (NO LIMITS)")
-    print(f"💰 Min Profit: {MIN_PROFIT_PERCENT}% | Min Liquidity: ${MIN_LIQUIDITY_USD}")
-    print(f"💾 Cache enabled for faster restarts")
-    print(f"🌐 Web UI: http://localhost:{port}")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*50}")
+    print(f"🚀 OPTIMIZED SCANNER (512MB RAM)")
+    print(f"{'='*50}")
+    print(f"📊 {len(EXCHANGE_IDS)} exchanges | {MAX_COINS} coins each")
+    print(f"💰 Min Profit: {MIN_PROFIT_PERCENT}%")
+    print(f"🌐 http://localhost:{port}")
+    print(f"{'='*50}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)

@@ -8,9 +8,9 @@ import os
 import json
 from datetime import datetime
 
-# ================= MEMORY-OPTIMIZED CONFIG =================
-EXCHANGE_IDS = ["gateio", "kucoin", "mexc", "bitget", "coinex"]  # Prioritize biggest first
-MAX_COINS = 300  # REDUCED from unlimited to 300 per exchange (saves memory)
+# ================= CONFIG =================
+EXCHANGE_IDS = ["gateio", "kucoin", "mexc", "bitget", "coinex"]
+MAX_COINS = 300
 CACHE_FILE = "symbols_cache.json"
 
 # ================= TRADING CONFIG =================
@@ -32,12 +32,14 @@ WITHDRAWAL_FEES = {
 
 MIN_PROFIT_PERCENT = 0.1
 MIN_LIQUIDITY_USD = 30
-BATCH_SIZE = 10  # Smaller batches = less memory
+BATCH_SIZE = 10
+MARKET_LOAD_TIMEOUT = 20  # 20 seconds timeout per exchange
 
 app = FastAPI()
 latest_opportunities = []
 all_symbols = []
 exchanges = {}
+exchanges_loaded = 0  # Track how many exchanges loaded successfully
 
 # ================= CACHE FUNCTIONS =================
 def load_cached_symbols():
@@ -56,8 +58,9 @@ def save_cached_symbols(cache):
     except:
         pass
 
-# ================= LOAD EXCHANGE (MEMORY OPTIMIZED) =================
+# ================= LOAD EXCHANGE WITH TIMEOUT =================
 async def load_exchange(exchange_id, cached_data):
+    global exchanges_loaded
     start = datetime.now()
     exchange = None
 
@@ -65,7 +68,7 @@ async def load_exchange(exchange_id, cached_data):
         exchange_class = getattr(ccxt, exchange_id)
 
         config = {
-            "enableRateLimit": True,  # Enable rate limiting to avoid bans
+            "enableRateLimit": True,
             "timeout": 30000,
             "options": {"defaultType": "spot"}
         }
@@ -83,25 +86,38 @@ async def load_exchange(exchange_id, cached_data):
         exchange = exchange_class(config)
         print(f"⚡ Loading {exchange_id}...")
 
-        # CHECK CACHE
+        # CHECK CACHE FIRST
         if exchange_id in cached_data:
             symbols = [s for s in cached_data[exchange_id] if s.endswith('/USDT')][:MAX_COINS]
             print(f"✓ {exchange_id}: {len(symbols)} cached USDT symbols")
+            exchanges_loaded += 1
             return {"id": exchange_id, "exchange": exchange, "symbols": symbols}
 
-        # LOAD MARKETS
-        await exchange.load_markets()
+        # LOAD MARKETS WITH TIMEOUT
+        print(f"📡 {exchange_id}: Loading markets (timeout: {MARKET_LOAD_TIMEOUT}s)...")
+        try:
+            await asyncio.wait_for(exchange.load_markets(), timeout=MARKET_LOAD_TIMEOUT)
+        except asyncio.TimeoutError:
+            print(f"⏰ {exchange_id} TIMEOUT - skipping (took >{MARKET_LOAD_TIMEOUT}s)")
+            if exchange:
+                try:
+                    await exchange.close()
+                except:
+                    pass
+            return None
         
         # GET ONLY USDT PAIRS, LIMITED TO MAX_COINS
-        symbols = [s for s in exchange.symbols if s.endswith('/USDT')][:MAX_COINS]
+        usdt_symbols = [s for s in exchange.symbols if s.endswith('/USDT')]
+        symbols = usdt_symbols[:MAX_COINS]
 
         elapsed = (datetime.now() - start).total_seconds()
         print(f"✓ {exchange_id}: {len(symbols)} USDT symbols in {elapsed:.1f}s")
+        exchanges_loaded += 1
 
         return {"id": exchange_id, "exchange": exchange, "symbols": symbols}
 
     except Exception as e:
-        print(f"❌ {exchange_id} failed: {str(e)[:50]}")
+        print(f"❌ {exchange_id} failed: {type(e).__name__}: {e}")
         if exchange:
             try:
                 await exchange.close()
@@ -109,29 +125,40 @@ async def load_exchange(exchange_id, cached_data):
                 pass
         return None
 
-# ================= INITIALIZE =================
+# ================= SAFE LOAD WRAPPER =================
+async def safe_load(exchange_id, cached_data):
+    """Safe wrapper for load_exchange with exception handling"""
+    try:
+        return await load_exchange(exchange_id, cached_data)
+    except Exception as e:
+        print(f"❌ {exchange_id} failed hard: {e}")
+        return None
+
+# ================= INITIALIZE EXCHANGES =================
 async def initialize_exchanges():
-    global exchanges, all_symbols
+    global exchanges, all_symbols, exchanges_loaded
     
     print("\n" + "="*50)
     print("🚀 MEMORY-OPTIMIZED SCANNER (512MB)")
+    print(f"⏱️  Exchange timeout: {MARKET_LOAD_TIMEOUT}s")
     print("="*50)
 
     cached_data = load_cached_symbols()
+    exchanges_loaded = 0
 
-    # LOAD SEQUENTIALLY (less memory spike than parallel)
+    # LOAD ALL EXCHANGES IN PARALLEL WITH SAFE WRAPPER
+    tasks = [safe_load(exchange_id, cached_data) for exchange_id in EXCHANGE_IDS]
+    results = await asyncio.gather(*tasks)
+
     new_exchanges = {}
     symbols_map = {}
     new_cache = {}
 
-    for exchange_id in EXCHANGE_IDS:
-        result = await load_exchange(exchange_id, cached_data)
+    for result in results:
         if result:
             new_exchanges[result["id"]] = result["exchange"]
             symbols_map[result["id"]] = result["symbols"]
             new_cache[result["id"]] = result["symbols"]
-            # Small delay to let memory settle
-            await asyncio.sleep(0.5)
 
     if new_cache:
         save_cached_symbols(new_cache)
@@ -145,11 +172,25 @@ async def initialize_exchanges():
     all_symbols = list(all_symbols_set)
 
     print("="*50)
-    print(f"✅ {len(exchanges)} exchanges loaded")
+    print(f"✅ {len(exchanges)}/{len(EXCHANGE_IDS)} exchanges loaded")
     print(f"📊 {len(all_symbols)} USDT pairs to scan")
     print("="*50 + "\n")
     
     return len(exchanges) >= 2
+
+# ================= HEALTH CHECK ENDPOINT =================
+@app.get("/health")
+@app.head("/health")
+async def health():
+    """Health check endpoint for uptime monitoring"""
+    return {
+        "status": "ok",
+        "exchanges_loaded": exchanges_loaded,
+        "total_exchanges": len(EXCHANGE_IDS),
+        "active_opportunities": len(latest_opportunities),
+        "symbols_loaded": len(all_symbols),
+        "timestamp": datetime.now().isoformat()
+    }
 
 # ================= SCAN SYMBOL =================
 async def scan_symbol(symbol):
@@ -202,9 +243,7 @@ async def scan_symbol(symbol):
         
         if best_opp and best_profit >= MIN_PROFIT_PERCENT:
             buy_ex, sell_ex, b, s, profit_pct, liquidity = best_opp
-            
-            # Simplified profit calculation
-            withdrawal_fee = 0.10  # Average fee
+            withdrawal_fee = 0.10
             net_profit_pct = profit_pct - 0.1
             
             return {
@@ -235,7 +274,7 @@ async def continuous_scanner():
     
     success = await initialize_exchanges()
     if not success or not all_symbols:
-        print("❌ Failed to initialize")
+        print("❌ Failed to initialize exchanges")
         return
     
     print(f"🔄 SCANNING {len(all_symbols)} USDT pairs...\n")
@@ -275,7 +314,7 @@ async def continuous_scanner():
             await asyncio.sleep(0.05)
             
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"❌ Scan error: {e}")
             await asyncio.sleep(1)
 
 # ================= WEB UI =================
@@ -289,7 +328,7 @@ async def get():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Arbitrage Scanner - Optimized</title>
+    <title>Arbitrage Scanner - Health Check</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -298,7 +337,7 @@ async def get():
         .header { text-align: center; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid #222; }
         .header h1 { font-size: 24px; color: #fff; }
         .badge { display: inline-block; background: #2ecc71; color: #0a0a0a; padding: 4px 10px; border-radius: 16px; font-size: 10px; font-weight: 600; margin: 6px 0; }
-        .mem-badge { background: #3498db; }
+        .health-badge { background: #3498db; }
         .stats { display: flex; justify-content: space-between; margin-bottom: 16px; font-size: 12px; color: #666; }
         .live-indicator { display: inline-block; width: 8px; height: 8px; background: #2ecc71; border-radius: 50%; animation: blink 1s infinite; margin-right: 6px; }
         @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
@@ -337,7 +376,7 @@ async def get():
             <h1>🚀 Arbitrage Scanner</h1>
             <div>
                 <span class="badge">📊 5 EXCHANGES</span>
-                <span class="badge mem-badge">⚡ 512MB OPTIMIZED</span>
+                <span class="badge health-badge">❤️ HEALTH CHECK ENABLED</span>
             </div>
         </div>
         <div class="stats">
@@ -345,7 +384,7 @@ async def get():
             <span id="count">0 opportunities</span>
         </div>
         <div id="opportunities-container"></div>
-        <div class="footer">💰 0.1%+ profit | $30+ liquidity | Optimized for 512MB RAM</div>
+        <div class="footer">💰 0.1%+ profit | $30+ liquidity | Health check at /health</div>
     </div>
     <script>
         let allOpportunities = [], expandedCard = null;
@@ -356,7 +395,7 @@ async def get():
         function updateDisplay() {
             const c = document.getElementById('opportunities-container');
             document.getElementById('count').textContent = allOpportunities.length + ' opportunities';
-            if(allOpportunities.length===0){ c.innerHTML='<div class="no-data">🔍 Scanning USDT markets...<br><span style="font-size:12px;">MEXC | Gate.io | KuCoin | CoinEx | Bitget</span><br><span style="font-size:11px;">Optimized for 512MB RAM</span></div>'; return; }
+            if(allOpportunities.length===0){ c.innerHTML='<div class="no-data">🔍 Loading exchanges (20s timeout each)...<br><span style="font-size:12px;">Gate.io | KuCoin | MEXC | Bitget | CoinEx</span><br><span style="font-size:11px;">Health check available at /health</span></div>'; return; }
             c.innerHTML = allOpportunities.map((opp,idx)=>`<div class="opportunity-card" onclick="toggleDetail(${idx},event)"><div class="card-main"><div class="left-section"><div class="exchange-pair"><span class="buy-text">BUY</span> <span class="exchange-name">${formatExchange(opp.buy_exchange)}</span> <span class="sell-text">→ SELL</span> <span class="exchange-name">${formatExchange(opp.sell_exchange)}</span></div><div class="token-symbol">${opp.symbol}/USDT</div><div class="details-row"><span>💰 $${opp.liquidity.toLocaleString()}</span><span>⏱️ ${timeAgo(opp.timestamp)}</span></div></div><div class="profit-section"><div class="spread-percent">${opp.spread}%</div><div class="net-profit">net: ${opp.net_profit}%</div></div></div><div class="detail-expanded" id="detail-${idx}"><div class="trade-section"><div class="trade-title">1️⃣ Buy at ${formatExchange(opp.buy_exchange)}</div><div class="info-row"><span class="info-label">Lowest Ask:</span><span class="info-value">$${opp.buy_price}</span></div><div class="info-row"><span class="info-label">Liquidity:</span><span class="info-value">$${opp.buy_liquidity.toLocaleString()}</span></div><div class="button-group"><a href="#" class="action-btn">📊 Go to ${formatExchange(opp.buy_exchange)}</a></div></div><div class="trade-section"><div class="trade-title">2️⃣ Sell at ${formatExchange(opp.sell_exchange)}</div><div class="info-row"><span class="info-label">Highest Bid:</span><span class="info-value">$${opp.sell_price}</span></div><div class="info-row"><span class="info-label">Liquidity:</span><span class="info-value">$${opp.sell_liquidity.toLocaleString()}</span></div><div class="button-group"><a href="#" class="action-btn">📊 Go to ${formatExchange(opp.sell_exchange)}</a></div></div><div class="info-row"><span class="info-label">Gross Spread:</span><span class="info-value">${opp.spread}%</span></div><div class="info-row"><span class="info-label">Net Profit:</span><span class="info-value">${opp.net_profit}% ($${opp.net_profit_usd} on $100)</span></div><div class="warning-box">⚠️ Double check coin contract before trading</div><div class="time-warning">🟢 Act fast - opportunities last 10-15 min</div></div></div>`).join('');
             expandedCard = null;
         }
@@ -380,10 +419,12 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 10000))
     print(f"\n{'='*50}")
-    print(f"🚀 OPTIMIZED SCANNER (512MB RAM)")
+    print(f"🚀 SCANNER WITH HEALTH CHECK")
     print(f"{'='*50}")
     print(f"📊 {len(EXCHANGE_IDS)} exchanges | {MAX_COINS} coins each")
+    print(f"⏱️  Exchange timeout: {MARKET_LOAD_TIMEOUT}s")
     print(f"💰 Min Profit: {MIN_PROFIT_PERCENT}%")
-    print(f"🌐 http://localhost:{port}")
+    print(f"❤️ Health check: http://localhost:{port}/health")
+    print(f"🌐 Web UI: http://localhost:{port}")
     print(f"{'='*50}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)

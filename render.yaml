@@ -1,8 +1,6 @@
 services:
-    - type: web
-    name: arb-scanner-free
+  - type: web
+    name: arbihunt
     env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python app_ws.py"
-    healthCheckPath: /
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py

@@ -10,8 +10,9 @@ from datetime import datetime
 
 # ================= CONFIG - ULTRA FAST =================
 EXCHANGE_IDS = ["gateio", "kucoin", "mexc", "bitget", "coinex"]
-MAX_COINS = 200  # Reduced from 300 for speed
+MAX_COINS = 500  # Scan ALL coins
 CACHE_FILE = "symbols_cache.json"
+CACHE_TTL = 3600  # Cache markets for 1 hour
 
 # ================= TRADING CONFIG =================
 TRADING_FEES = {
@@ -22,19 +23,12 @@ TRADING_FEES = {
     'coinex': 0.2,
 }
 
-WITHDRAWAL_FEES = {
-    'gateio': {'ERC20': 0.15, 'TRC20': 0.09, 'BEP20': 0.05},
-    'kucoin': {'ERC20': 0.15, 'TRC20': 0.08, 'BEP20': 0.06},
-    'mexc': {'ERC20': 0.14, 'TRC20': 0.10, 'BEP20': 0.05},
-    'bitget': {'ERC20': 0.12, 'TRC20': 0.07, 'BEP20': 0.04},
-    'coinex': {'ERC20': 0.13, 'TRC20': 0.08, 'BEP20': 0.05},
-}
-
 # ULTRA FAST SETTINGS
-MIN_PROFIT_PERCENT = 0.05  # Reduced to 0.05% for more opportunities
-MIN_LIQUIDITY_USD = 1      # Reduced from 30 to 1 - catch everything
-BATCH_SIZE = 20            # Larger batches for speed
-MARKET_LOAD_TIMEOUT = 15   # Reduced timeout
+MIN_PROFIT_PERCENT = 0.01  # Catch tiny spreads
+MIN_LIQUIDITY_USD = 10     # Minimum liquidity
+BATCH_SIZE = 50            # Big batches for speed
+MARKET_LOAD_TIMEOUT = 20   # Timeout for loading
+SCAN_TIMEOUT = 2.0         # Per-symbol scan timeout
 
 app = FastAPI()
 latest_opportunities = []
@@ -42,25 +36,28 @@ all_symbols = []
 exchanges = {}
 exchanges_loaded = 0
 scanning_active = False
+scan_round = 0
 
 # ================= CACHE FUNCTIONS =================
 def load_cached_symbols():
     try:
         if os.path.exists(CACHE_FILE):
             with open(CACHE_FILE, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                if time.time() - data.get('timestamp', 0) < CACHE_TTL:
+                    return data.get('symbols', {})
     except:
         pass
     return {}
 
-def save_cached_symbols(cache):
+def save_cached_symbols(symbols_dict):
     try:
         with open(CACHE_FILE, 'w') as f:
-            json.dump(cache, f)
+            json.dump({'timestamp': time.time(), 'symbols': symbols_dict}, f)
     except:
         pass
 
-# ================= LOAD EXCHANGE WITH TIMEOUT =================
+# ================= LOAD EXCHANGE =================
 async def load_exchange(exchange_id, cached_data):
     global exchanges_loaded, all_symbols, scanning_active
     
@@ -71,72 +68,68 @@ async def load_exchange(exchange_id, cached_data):
         exchange_class = getattr(ccxt, exchange_id)
 
         config = {
-            "enableRateLimit": False,  # Disable rate limit for MAX SPEED
-            "timeout": 15000,          # 15 second timeout
+            "enableRateLimit": False,
+            "timeout": 20000,
             "options": {"defaultType": "spot"}
         }
 
-        # ADD API KEYS
+        # ✅ FIXED: Correct env variable names for each exchange
         api_key = os.getenv(f'{exchange_id.upper()}_API_KEY', '')
-        api_secret = os.getenv(f'{exchange_id.upper()}_SECRET', '')
         
+        if exchange_id == 'mexc' or exchange_id == 'bitget':
+            api_secret = os.getenv(f'{exchange_id.upper()}_SECRET_KEY', '')
+        elif exchange_id == 'kucoin':
+            api_secret = os.getenv(f'{exchange_id.upper()}_API_SECRET', '')
+        else:
+            api_secret = os.getenv(f'{exchange_id.upper()}_API_SECRET', '')
+        
+        if exchange_id == 'kucoin':
+            passphrase = os.getenv('KUCOIN_API_PASSPHRASE', '')
+            if passphrase:
+                config['password'] = passphrase
+        elif exchange_id == 'bitget':
+            passphrase = os.getenv('BITGET_PASSPHRASE', '')
+            if passphrase:
+                config['password'] = passphrase
+
         if api_key and api_secret:
             config['apiKey'] = api_key
             config['secret'] = api_secret
-            if exchange_id == 'kucoin':
-                config['password'] = os.getenv('KUCOIN_PASSWORD', '')
 
         exchange = exchange_class(config)
         print(f"⚡ Loading {exchange_id}...")
 
         # CHECK CACHE FIRST
         if exchange_id in cached_data:
-            symbols = [s for s in cached_data[exchange_id] if s.endswith('/USDT')][:MAX_COINS]
-            print(f"✓ {exchange_id}: {len(symbols)} cached USDT symbols")
-            
-            exchanges[exchange_id] = exchange
-            exchanges_loaded += 1
-            
-            new_symbols = set(all_symbols)
-            new_symbols.update(symbols)
-            all_symbols = list(new_symbols)
-            
-            print(f"📊 Total symbols: {len(all_symbols)} | Exchanges: {exchanges_loaded}")
-            
-            if exchanges_loaded >= 2 and not scanning_active:
-                scanning_active = True
-                asyncio.create_task(continuous_scanner())
-            
-            return {"id": exchange_id, "exchange": exchange, "symbols": symbols}
-
-        # LOAD MARKETS WITH TIMEOUT
-        print(f"📡 {exchange_id}: Loading markets...")
-        try:
-            await asyncio.wait_for(exchange.load_markets(), timeout=MARKET_LOAD_TIMEOUT)
-        except asyncio.TimeoutError:
-            print(f"⏰ {exchange_id} TIMEOUT - skipping")
-            if exchange:
-                try:
+            symbols = [s for s in cached_data[exchange_id] if s.endswith('/USDT')]
+            print(f"✓ {exchange_id}: {len(symbols)} USDT pairs (cached)")
+        else:
+            # LOAD FRESH MARKETS
+            print(f"📡 {exchange_id}: Fetching all spot markets...")
+            try:
+                await asyncio.wait_for(exchange.load_markets(), timeout=MARKET_LOAD_TIMEOUT)
+            except asyncio.TimeoutError:
+                print(f"⏰ {exchange_id} TIMEOUT")
+                if exchange:
                     await exchange.close()
-                except:
-                    pass
-            return None
-        
-        usdt_symbols = [s for s in exchange.symbols if s.endswith('/USDT')]
-        symbols = usdt_symbols[:MAX_COINS]
+                return None
+            
+            usdt_symbols = [s for s in exchange.symbols if s.endswith('/USDT')]
+            symbols = usdt_symbols[:MAX_COINS]
+            print(f"✓ {exchange_id}: {len(symbols)} USDT pairs loaded")
 
-        elapsed = (datetime.now() - start).total_seconds()
-        print(f"✓ {exchange_id}: {len(symbols)} USDT symbols in {elapsed:.1f}s")
-        
         exchanges[exchange_id] = exchange
         exchanges_loaded += 1
         
-        new_symbols = set(all_symbols)
-        new_symbols.update(symbols)
-        all_symbols = list(new_symbols)
+        # Merge all symbols
+        symbol_set = set(all_symbols)
+        symbol_set.update(symbols)
+        all_symbols = list(symbol_set)
         
-        print(f"📊 Total symbols: {len(all_symbols)} | Exchanges: {exchanges_loaded}")
+        elapsed = (datetime.now() - start).total_seconds()
+        print(f"📊 {exchange_id} ready in {elapsed:.1f}s | Total: {len(all_symbols)} pairs | Exchanges: {exchanges_loaded}")
         
+        # Start scanner when we have at least 2 exchanges
         if exchanges_loaded >= 2 and not scanning_active:
             scanning_active = True
             asyncio.create_task(continuous_scanner())
@@ -144,7 +137,7 @@ async def load_exchange(exchange_id, cached_data):
         return {"id": exchange_id, "exchange": exchange, "symbols": symbols}
 
     except Exception as e:
-        print(f"❌ {exchange_id} failed: {type(e).__name__}: {e}")
+        print(f"❌ {exchange_id} ERROR: {type(e).__name__}: {str(e)[:100]}")
         if exchange:
             try:
                 await exchange.close()
@@ -157,37 +150,41 @@ async def safe_load(exchange_id, cached_data):
     try:
         return await load_exchange(exchange_id, cached_data)
     except Exception as e:
-        print(f"❌ {exchange_id} failed hard: {e}")
+        print(f"❌ {exchange_id} FATAL: {e}")
         return None
 
-# ================= INITIALIZE EXCHANGES =================
+# ================= INITIALIZE ALL EXCHANGES =================
 async def initialize_exchanges():
     global exchanges, all_symbols, exchanges_loaded, scanning_active
     
-    print("\n" + "="*50)
-    print("⚡ ULTRA-FAST SCAN MODE")
+    print("\n" + "="*60)
+    print("⚡ ULTRA-FAST ARBITRAGE SCANNER")
     print(f"💰 Min Profit: {MIN_PROFIT_PERCENT}% | Min Liq: ${MIN_LIQUIDITY_USD}")
-    print("="*50)
+    print(f"📊 Max pairs per exchange: {MAX_COINS}")
+    print("="*60 + "\n")
 
     cached_data = load_cached_symbols()
     exchanges_loaded = 0
     scanning_active = False
+    all_symbols = []
 
-    tasks = [safe_load(exchange_id, cached_data) for exchange_id in EXCHANGE_IDS]
+    # Load all exchanges in parallel
+    tasks = [safe_load(eid, cached_data) for eid in EXCHANGE_IDS]
     results = await asyncio.gather(*tasks)
 
+    # Save successful caches
     new_cache = {}
     for result in results:
-        if result:
+        if result and result.get("symbols"):
             new_cache[result["id"]] = result["symbols"]
-
+    
     if new_cache:
         save_cached_symbols(new_cache)
 
-    print("="*50)
+    print("\n" + "="*60)
     print(f"✅ {exchanges_loaded}/{len(EXCHANGE_IDS)} exchanges loaded")
-    print(f"📊 {len(all_symbols)} USDT pairs ready")
-    print("="*50 + "\n")
+    print(f"📊 {len(all_symbols)} unique USDT pairs to scan")
+    print("="*60 + "\n")
     
     return exchanges_loaded >= 2
 
@@ -201,151 +198,150 @@ async def health():
         "active_opportunities": len(latest_opportunities),
         "symbols_loaded": len(all_symbols),
         "scanning_active": scanning_active,
+        "scan_round": scan_round,
         "timestamp": datetime.now().isoformat()
     }
 
-# ================= ULTRA FAST SCAN SYMBOL =================
+# ================= ULTRA FAST SCAN SINGLE SYMBOL =================
 async def scan_symbol(symbol):
     try:
         tasks = []
         ex_names = []
         
         for name, ex in exchanges.items():
-            tasks.append(ex.fetch_order_book(symbol, limit=1))
+            tasks.append(asyncio.wait_for(ex.fetch_order_book(symbol, limit=1), timeout=1.5))
             ex_names.append(name)
         
         if len(tasks) < 2:
             return None
         
-        # Ultra fast - short timeout
-        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3.0)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
         data = {}
-        for i, (name, result) in enumerate(zip(ex_names, results)):
+        for name, result in zip(ex_names, results):
             if isinstance(result, Exception):
                 continue
-            if result and result.get('asks') and result.get('bids') and len(result['asks']) > 0:
-                ask_price = result['asks'][0][0]
-                bid_price = result['bids'][0][0]
-                data[name] = {
-                    'ask': ask_price,
-                    'bid': bid_price,
-                    'ask_vol': result['asks'][0][1] * ask_price,
-                    'bid_vol': result['bids'][0][1] * bid_price,
-                }
+            if result and result.get('asks') and result.get('bids'):
+                if len(result['asks']) > 0 and len(result['bids']) > 0:
+                    ask_price = result['asks'][0][0]
+                    bid_price = result['bids'][0][0]
+                    ask_vol = result['asks'][0][1] if len(result['asks'][0]) > 1 else 0
+                    bid_vol = result['bids'][0][1] if len(result['bids'][0]) > 1 else 0
+                    data[name] = {
+                        'ask': ask_price,
+                        'bid': bid_price,
+                        'ask_vol_usd': ask_vol * ask_price,
+                        'bid_vol_usd': bid_vol * bid_price,
+                    }
         
         if len(data) < 2:
             return None
         
-        best_profit = 0
         best_opp = None
+        best_profit = 0
         
         for buy_ex, b in data.items():
             for sell_ex, s in data.items():
                 if buy_ex == sell_ex:
                     continue
                 
-                buy_cost = b['ask'] * (1 + TRADING_FEES.get(buy_ex, 0.1) / 100)
-                sell_rev = s['bid'] * (1 - TRADING_FEES.get(sell_ex, 0.1) / 100)
-                profit_pct = (sell_rev - buy_cost) / buy_cost * 100
-                liquidity = min(b['ask_vol'], s['bid_vol'])
+                buy_fee = TRADING_FEES.get(buy_ex, 0.1) / 100
+                sell_fee = TRADING_FEES.get(sell_ex, 0.1) / 100
                 
-                if profit_pct > best_profit and liquidity > MIN_LIQUIDITY_USD:
+                buy_cost = b['ask'] * (1 + buy_fee)
+                sell_rev = s['bid'] * (1 - sell_fee)
+                profit_pct = (sell_rev - buy_cost) / buy_cost * 100
+                liquidity = min(b['ask_vol_usd'], s['bid_vol_usd'])
+                
+                if profit_pct > best_profit and liquidity >= MIN_LIQUIDITY_USD:
                     best_profit = profit_pct
-                    best_opp = (buy_ex, sell_ex, b, s, profit_pct, liquidity)
+                    best_opp = {
+                        'symbol': symbol.replace('/USDT', ''),
+                        'buy_exchange': buy_ex.upper(),
+                        'sell_exchange': sell_ex.upper(),
+                        'buy_price': b['ask'],
+                        'sell_price': s['bid'],
+                        'spread': round(profit_pct, 4),
+                        'net_profit': round(profit_pct - 0.05, 4),
+                        'liquidity': round(liquidity, 0),
+                        'buy_liquidity': round(b['ask_vol_usd'], 0),
+                        'sell_liquidity': round(s['bid_vol_usd'], 0),
+                        'timestamp': time.time()
+                    }
         
         if best_opp and best_profit >= MIN_PROFIT_PERCENT:
-            buy_ex, sell_ex, b, s, profit_pct, liquidity = best_opp
-            withdrawal_fee = 0.05
-            net_profit_pct = profit_pct - 0.05
-            
-            return {
-                'symbol': symbol.replace('/USDT', ''),
-                'buy_exchange': buy_ex.upper(),
-                'sell_exchange': sell_ex.upper(),
-                'buy_price': b['ask'],
-                'sell_price': s['bid'],
-                'spread': round(profit_pct, 2),
-                'net_profit': round(net_profit_pct, 2),
-                'net_profit_usd': round(profit_pct - 0.05, 2),
-                'withdrawal_fee': 0.05,
-                'recommended_network': 'BEP20',
-                'buy_networks': 'BEP20 ($0.05) | TRC20 ($0.10)',
-                'sell_networks': 'BEP20 (Free) | TRC20 (Free)',
-                'liquidity': round(liquidity, 0),
-                'buy_liquidity': round(b['ask_vol'], 0),
-                'sell_liquidity': round(s['bid_vol'], 0),
-                'timestamp': time.time()
-            }
+            return best_opp
         return None
-    except asyncio.TimeoutError:
-        return None
-    except:
+        
+    except Exception:
         return None
 
-# ================= ULTRA FAST CONTINUOUS SCANNER =================
+# ================= CONTINUOUS SCANNER - ULTRA FAST =================
 async def continuous_scanner():
-    global latest_opportunities, all_symbols, scanning_active
+    global latest_opportunities, all_symbols, scanning_active, scan_round
     
     if len(all_symbols) == 0:
-        print("❌ No symbols to scan")
+        print("❌ No symbols to scan!")
         scanning_active = False
         return
     
-    print(f"\n⚡ ULTRA-FAST SCANNER ACTIVE")
-    print(f"💰 Min Profit: {MIN_PROFIT_PERCENT}% | Min Liquidity: ${MIN_LIQUIDITY_USD}")
-    print(f"📊 Scanning {len(all_symbols)} pairs continuously\n")
+    print(f"\n⚡ SCANNER ACTIVE - {len(all_symbols)} pairs")
+    print(f"🔄 Continuous scanning with batch size {BATCH_SIZE}\n")
     
     scan_index = 0
-    last_log = time.time()
-    scanned = 0
+    cycle_start = time.time()
+    opportunities_found = 0
     
     while True:
         try:
-            current_symbols = all_symbols.copy()
-            
-            if scan_index >= len(current_symbols):
+            # Reset index if we've scanned all symbols
+            if scan_index >= len(all_symbols):
+                scan_round += 1
+                cycle_time = time.time() - cycle_start
+                print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 Round {scan_round} done in {cycle_time:.1f}s")
+                print(f"   📊 {len(latest_opportunities)} active opportunities | {opportunities_found} found this round")
+                print(f"   💰 Top spread: {latest_opportunities[0]['spread']}% - {latest_opportunities[0]['symbol']}" if latest_opportunities else "   ⚠️ No opportunities found")
+                cycle_start = time.time()
                 scan_index = 0
-                elapsed_cycle = time.time() - last_cycle_start if 'last_cycle_start' in dir() else 0
-                print(f"[{time.strftime('%H:%M:%S')}] 🔄 Cycle complete in {elapsed_cycle:.1f}s | {len(latest_opportunities)} active")
-                last_cycle_start = time.time()
-                scanned = 0
+                opportunities_found = 0
             
-            batch = current_symbols[scan_index:scan_index + BATCH_SIZE]
+            # Get next batch
+            batch = all_symbols[scan_index:scan_index + BATCH_SIZE]
             scan_index += BATCH_SIZE
             
-            # Ultra fast parallel scanning
+            # Scan batch in parallel
             tasks = [scan_symbol(symbol) for symbol in batch]
             results = await asyncio.gather(*tasks)
             
+            # Process results
             for result in results:
                 if result:
+                    opportunities_found += 1
+                    # Remove old entry for same symbol
                     latest_opportunities = [o for o in latest_opportunities if o['symbol'] != result['symbol']]
                     latest_opportunities.append(result)
+                    # Sort and keep top 50
                     latest_opportunities.sort(key=lambda x: x['spread'], reverse=True)
-                    if len(latest_opportunities) > 30:
-                        latest_opportunities = latest_opportunities[:30]
-                    print(f"  🎯 {result['symbol']} - {result['spread']}%")
+                    latest_opportunities = latest_opportunities[:50]
             
-            scanned += len(batch)
+            # Print progress every 100 symbols
+            if scan_index % 100 == 0:
+                pct = (scan_index / len(all_symbols)) * 100 if len(all_symbols) > 0 else 0
+                print(f"[{time.strftime('%H:%M:%S')}] 📊 {scan_index}/{len(all_symbols)} ({pct:.0f}%) | Found: {opportunities_found} | Active: {len(latest_opportunities)}")
             
-            # Log less frequently for speed
-            if time.time() - last_log > 10:
-                last_log = time.time()
-                print(f"[{time.strftime('%H:%M:%S')}] 📊 {scanned}/{len(current_symbols)} | Active: {len(latest_opportunities)}")
-            
-            # Minimal delay for maximum speed
-            await asyncio.sleep(0.01)
+            # Minimal delay
+            await asyncio.sleep(0.005)
             
         except Exception as e:
-            print(f"❌ Scan error: {e}")
-            await asyncio.sleep(0.5)
+            print(f"❌ Scanner error: {e}")
+            await asyncio.sleep(1)
 
-# ================= WEB UI =================
+# ================= STARTUP =================
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(initialize_exchanges())
 
+# ================= WEB UI =================
 @app.get("/")
 async def get():
     return HTMLResponse("""
@@ -354,100 +350,189 @@ async def get():
 <head>
     <title>Ultra-Fast Arbitrage Scanner</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="300">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: #0a0a0a; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 16px; }
-        .container { max-width: 600px; margin: 0 auto; }
-        .header { text-align: center; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid #222; }
-        .header h1 { font-size: 24px; color: #fff; }
-        .badge { display: inline-block; background: #2ecc71; color: #0a0a0a; padding: 4px 10px; border-radius: 16px; font-size: 10px; font-weight: 600; margin: 6px 0; }
-        .ultra-badge { background: #e74c3c; }
-        .stats { display: flex; justify-content: space-between; margin-bottom: 16px; font-size: 12px; color: #666; }
-        .live-indicator { display: inline-block; width: 8px; height: 8px; background: #2ecc71; border-radius: 50%; animation: blink 1s infinite; margin-right: 6px; }
-        @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-        .opportunity-card { background: #121212; border-radius: 12px; margin-bottom: 8px; border: 1px solid #1e1e1e; cursor: pointer; transition: all 0.2s; }
-        .opportunity-card:hover { border-color: #f39c12; background: #161616; transform: translateX(4px); }
-        .card-main { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; }
-        .left-section { flex: 1; }
-        .exchange-pair { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
-        .buy-text { color: #2ecc71; }
-        .sell-text { color: #e74c3c; }
-        .exchange-name { color: #fff; margin: 0 3px; }
-        .token-symbol { font-size: 16px; font-weight: 700; color: #fff; margin-top: 4px; }
-        .details-row { display: flex; gap: 16px; font-size: 11px; color: #666; margin-top: 6px; }
-        .profit-section { text-align: right; }
-        .spread-percent { font-size: 22px; font-weight: 700; color: #2ecc71; }
-        .net-profit { font-size: 11px; color: #666; margin-top: 2px; }
-        .detail-expanded { border-top: 1px solid #1e1e1e; padding: 16px; background: #0d0d0d; display: none; }
-        .detail-expanded.show { display: block; }
-        .trade-section { margin-bottom: 20px; }
-        .trade-title { font-size: 14px; font-weight: 600; color: #fff; margin-bottom: 12px; }
-        .info-row { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 13px; }
-        .info-label { color: #888; }
-        .info-value { color: #fff; font-weight: 500; }
-        .button-group { display: flex; gap: 12px; margin: 16px 0; }
-        .action-btn { flex: 1; background: #1a1a1a; border: 1px solid #2a2a2a; color: #e0e0e0; padding: 10px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; text-align: center; text-decoration: none; }
-        .action-btn:hover { background: #f39c12; border-color: #f39c12; color: #0a0a0a; }
-        .warning-box { background: rgba(231,76,60,0.1); border-left: 3px solid #e74c3c; padding: 12px; font-size: 12px; color: #e74c3c; margin: 16px 0; border-radius: 6px; }
-        .time-warning { color: #f39c12; font-size: 11px; text-align: center; padding: 10px; background: rgba(243,156,18,0.1); border-radius: 8px; }
-        .no-data { text-align: center; color: #555; padding: 40px; background: #121212; border-radius: 12px; }
-        .footer { text-align: center; font-size: 10px; color: #444; margin-top: 20px; padding-top: 12px; border-top: 1px solid #1e1e1e; }
+        body { background: #0a0a0a; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 12px; }
+        .container { max-width: 650px; margin: 0 auto; }
+        .header { text-align: center; margin-bottom: 16px; padding-bottom: 10px; border-bottom: 1px solid #222; }
+        .header h1 { font-size: 22px; color: #fff; }
+        .badge { display: inline-block; background: #2ecc71; color: #0a0a0a; padding: 3px 8px; border-radius: 12px; font-size: 10px; font-weight: 600; margin: 4px 2px; }
+        .stats { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 11px; color: #666; background: #111; padding: 10px 14px; border-radius: 10px; }
+        .live-dot { display: inline-block; width: 7px; height: 7px; background: #2ecc71; border-radius: 50%; animation: pulse 1s infinite; margin-right: 5px; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.2; } }
+        .opp-card { background: #111; border-radius: 10px; margin-bottom: 6px; border: 1px solid #1a1a1a; cursor: pointer; transition: all 0.15s; overflow: hidden; }
+        .opp-card:hover { border-color: #f39c12; }
+        .card-main { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; }
+        .left-side { flex: 1; min-width: 0; }
+        .route { font-size: 11px; margin-bottom: 4px; }
+        .buy-tag { color: #2ecc71; font-weight: 600; }
+        .sell-tag { color: #e74c3c; font-weight: 600; }
+        .arrow { color: #666; margin: 0 4px; }
+        .coin { font-size: 16px; font-weight: 700; color: #fff; }
+        .meta { font-size: 10px; color: #555; margin-top: 3px; }
+        .right-side { text-align: right; flex-shrink: 0; }
+        .spread { font-size: 20px; font-weight: 700; color: #2ecc71; }
+        .net { font-size: 10px; color: #666; }
+        .detail { display: none; border-top: 1px solid #1a1a1a; padding: 14px; background: #0d0d0d; }
+        .detail.show { display: block; }
+        .detail-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 12px; border-bottom: 1px solid #141414; }
+        .detail-label { color: #777; }
+        .detail-val { color: #fff; font-weight: 500; }
+        .warning { background: rgba(231,76,60,0.08); border-left: 2px solid #e74c3c; padding: 8px 10px; font-size: 11px; color: #e74c3c; margin-top: 10px; border-radius: 4px; }
+        .no-data { text-align: center; color: #444; padding: 50px 20px; background: #111; border-radius: 10px; font-size: 14px; }
+        .footer { text-align: center; font-size: 10px; color: #333; margin-top: 16px; padding-top: 10px; border-top: 1px solid #1a1a1a; }
+        @media (max-width: 480px) {
+            .card-main { padding: 10px; }
+            .coin { font-size: 14px; }
+            .spread { font-size: 17px; }
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>⚡ Ultra-Fast Arbitrage Scanner</h1>
+            <h1>⚡ Arbitrage Scanner</h1>
             <div>
                 <span class="badge">📊 5 EXCHANGES</span>
-                <span class="badge ultra-badge">⚡ MILLISECOND SCANS</span>
+                <span class="badge" style="background:#e74c3c;">ALL USDT PAIRS</span>
             </div>
         </div>
         <div class="stats">
-            <span><span class="live-indicator"></span> ULTRA FAST</span>
+            <span><span class="live-dot"></span>LIVE SCANNING</span>
             <span id="count">0 opportunities</span>
+            <span id="round" style="color:#555;">Round 0</span>
         </div>
-        <div id="opportunities-container"></div>
-        <div class="footer">💰 0.05%+ profit | $1+ liquidity | Millisecond scanning speed</div>
+        <div id="container"></div>
+        <div class="footer">🔍 Scanning all USDT spot pairs • 0.01%+ profit</div>
     </div>
     <script>
-        let allOpportunities = [], expandedCard = null;
+        let opps = [], expanded = null, roundNum = 0;
         const ws = new WebSocket(`ws://${location.host}/ws`);
-        function timeAgo(ts) { const s = Math.floor(Date.now()/1000 - ts); return s < 60 ? `${s}s ago` : `${Math.floor(s/60)}m ago`; }
-        function formatExchange(n) { const names={'MEXC':'MEXC','GATEIO':'Gate.io','KUCOIN':'KuCoin','COINEX':'CoinEx','BITGET':'Bitget'}; return names[n]||n; }
-        function toggleDetail(id,e) { e.stopPropagation(); const d = document.getElementById(`detail-${id}`); if(expandedCard===id){ d.classList.remove('show'); expandedCard=null; } else { if(expandedCard!==null) document.getElementById(`detail-${expandedCard}`).classList.remove('show'); d.classList.add('show'); expandedCard=id; } }
-        function updateDisplay() {
-            const c = document.getElementById('opportunities-container');
-            document.getElementById('count').textContent = allOpportunities.length + ' opportunities';
-            if(allOpportunities.length===0){ c.innerHTML='<div class="no-data">⚡ Ultra-fast scanning active...<br><span style="font-size:12px;">0.05%+ profit | $1+ liquidity</span><br><span style="font-size:11px;">Checking all USDT pairs in milliseconds</span></div>'; return; }
-            c.innerHTML = allOpportunities.map((opp,idx)=>`<div class="opportunity-card" onclick="toggleDetail(${idx},event)"><div class="card-main"><div class="left-section"><div class="exchange-pair"><span class="buy-text">BUY</span> <span class="exchange-name">${formatExchange(opp.buy_exchange)}</span> <span class="sell-text">→ SELL</span> <span class="exchange-name">${formatExchange(opp.sell_exchange)}</span></div><div class="token-symbol">${opp.symbol}/USDT</div><div class="details-row"><span>💰 $${opp.liquidity.toLocaleString()}</span><span>⏱️ ${timeAgo(opp.timestamp)}</span></div></div><div class="profit-section"><div class="spread-percent">${opp.spread}%</div><div class="net-profit">net: ${opp.net_profit}%</div></div></div><div class="detail-expanded" id="detail-${idx}"><div class="trade-section"><div class="trade-title">1️⃣ Buy at ${formatExchange(opp.buy_exchange)}</div><div class="info-row"><span class="info-label">Lowest Ask:</span><span class="info-value">$${opp.buy_price}</span></div><div class="info-row"><span class="info-label">Liquidity:</span><span class="info-value">$${opp.buy_liquidity.toLocaleString()}</span></div><div class="button-group"><a href="#" class="action-btn">📊 Go to ${formatExchange(opp.buy_exchange)}</a></div></div><div class="trade-section"><div class="trade-title">2️⃣ Sell at ${formatExchange(opp.sell_exchange)}</div><div class="info-row"><span class="info-label">Highest Bid:</span><span class="info-value">$${opp.sell_price}</span></div><div class="info-row"><span class="info-label">Liquidity:</span><span class="info-value">$${opp.sell_liquidity.toLocaleString()}</span></div><div class="button-group"><a href="#" class="action-btn">📊 Go to ${formatExchange(opp.sell_exchange)}</a></div></div><div class="info-row"><span class="info-label">Gross Spread:</span><span class="info-value">${opp.spread}%</span></div><div class="info-row"><span class="info-label">Net Profit:</span><span class="info-value">${opp.net_profit}% ($${opp.net_profit_usd} on $100)</span></div><div class="warning-box">⚠️ Double check coin contract before trading</div><div class="time-warning">🟢 Act fast - opportunities last 10-15 min</div></div></div>`).join('');
-            expandedCard = null;
+        
+        function ago(ts) {
+            const s = Math.floor(Date.now()/1000 - ts);
+            return s < 60 ? `${s}s` : `${Math.floor(s/60)}m`;
         }
-        ws.onmessage = (e) => { allOpportunities = JSON.parse(e.data); updateDisplay(); };
-        ws.onclose = () => setTimeout(() => location.reload(), 3000);
+        
+        function fmtEx(n) {
+            const m = {'MEXC':'MEXC','GATEIO':'Gate.io','KUCOIN':'KuCoin','COINEX':'CoinEx','BITGET':'Bitget'};
+            return m[n] || n;
+        }
+        
+        function toggle(i, e) {
+            e.stopPropagation();
+            const d = document.getElementById('d-'+i);
+            if (expanded === i) { d.classList.remove('show'); expanded = null; }
+            else {
+                if (expanded !== null) document.getElementById('d-'+expanded)?.classList.remove('show');
+                d.classList.add('show');
+                expanded = i;
+            }
+        }
+        
+        function render() {
+            document.getElementById('count').textContent = opps.length + ' opps';
+            document.getElementById('round').textContent = 'Round ' + roundNum;
+            const c = document.getElementById('container');
+            if (!opps.length) {
+                c.innerHTML = '<div class="no-data">⚡ Scanning all USDT pairs...<br><span style="font-size:12px;color:#555;">Checking order books in real-time</span></div>';
+                return;
+            }
+            c.innerHTML = opps.map((o,i) => `
+                <div class="opp-card" onclick="toggle(${i},event)">
+                    <div class="card-main">
+                        <div class="left-side">
+                            <div class="route">
+                                <span class="buy-tag">BUY</span> ${fmtEx(o.buy_exchange)}
+                                <span class="arrow">→</span>
+                                <span class="sell-tag">SELL</span> ${fmtEx(o.sell_exchange)}
+                            </div>
+                            <div class="coin">${o.symbol}/USDT</div>
+                            <div class="meta">💰 $${o.liquidity.toLocaleString()} • ⏱ ${ago(o.timestamp)}</div>
+                        </div>
+                        <div class="right-side">
+                            <div class="spread">${o.spread}%</div>
+                            <div class="net">net: ${o.net_profit}%</div>
+                        </div>
+                    </div>
+                    <div class="detail" id="d-${i}">
+                        <div class="detail-row"><span class="detail-label">Buy Price</span><span class="detail-val">$${o.buy_price} @ ${fmtEx(o.buy_exchange)}</span></div>
+                        <div class="detail-row"><span class="detail-label">Sell Price</span><span class="detail-val">$${o.sell_price} @ ${fmtEx(o.sell_exchange)}</span></div>
+                        <div class="detail-row"><span class="detail-label">Buy Liquidity</span><span class="detail-val">$${o.buy_liquidity.toLocaleString()}</span></div>
+                        <div class="detail-row"><span class="detail-label">Sell Liquidity</span><span class="detail-val">$${o.sell_liquidity.toLocaleString()}</span></div>
+                        <div class="detail-row"><span class="detail-label">Gross Spread</span><span class="detail-val">${o.spread}%</span></div>
+                        <div class="detail-row"><span class="detail-label">Net Profit (est.)</span><span class="detail-val">${o.net_profit}%</span></div>
+                        <div class="warning">⚠️ Verify contract address before trading. Prices change rapidly.</div>
+                    </div>
+                </div>
+            `).join('');
+            expanded = null;
+        }
+        
+        ws.onmessage = (e) => {
+            const data = JSON.parse(e.data);
+            if (data.type === 'opps') {
+                opps = data.data;
+                render();
+            } else if (data.type === 'round') {
+                roundNum = data.round;
+                document.getElementById('round').textContent = 'Round ' + roundNum;
+            }
+        };
+        
+        ws.onclose = () => setTimeout(() => location.reload(), 2000);
+        
+        // Fallback polling if WebSocket fails
+        setInterval(async () => {
+            if (ws.readyState !== WebSocket.OPEN) {
+                try {
+                    const res = await fetch('/api/opportunities');
+                    const data = await res.json();
+                    opps = data;
+                    render();
+                } catch(e) {}
+            }
+        }, 3000);
     </script>
 </body>
 </html>
     """)
 
+# ================= REST API FALLBACK =================
+@app.get("/api/opportunities")
+async def get_opportunities():
+    return latest_opportunities
+
+# ================= WEBSOCKET =================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    last_sent = []
+    last_data = None
+    last_round = 0
     while True:
-        if latest_opportunities != last_sent:
-            await websocket.send_json(latest_opportunities)
-            last_sent = latest_opportunities.copy()
-        await asyncio.sleep(1)
+        try:
+            current_data = json.dumps(latest_opportunities, default=str)
+            if current_data != last_data:
+                await websocket.send_json({"type": "opps", "data": latest_opportunities})
+                last_data = current_data
+            if scan_round != last_round:
+                await websocket.send_json({"type": "round", "round": scan_round})
+                last_round = scan_round
+            await asyncio.sleep(0.5)
+        except Exception:
+            break
 
+# ================= MAIN =================
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 10000))
-    print(f"\n{'='*50}")
+    print(f"\n{'='*60}")
     print(f"⚡ ULTRA-FAST ARBITRAGE SCANNER")
-    print(f"{'='*50}")
+    print(f"{'='*60}")
+    print(f"📊 Exchanges: {', '.join(EXCHANGE_IDS)}")
     print(f"💰 Min Profit: {MIN_PROFIT_PERCENT}%")
     print(f"💵 Min Liquidity: ${MIN_LIQUIDITY_USD}")
-    print(f"⚡ Scan speed: Milliseconds")
-    print(f"🌐 Web UI: http://localhost:{port}")
-    print(f"{'='*50}\n")
+    print(f"🔍 Scanning ALL USDT spot pairs")
+    print(f"🌐 Web UI: http://0.0.0.0:{port}")
+    print(f"{'='*60}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)

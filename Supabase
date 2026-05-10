@@ -1,0 +1,37 @@
+-- Profiles table
+CREATE TABLE profiles (
+  id UUID PRIMARY KEY,
+  email TEXT,
+  name TEXT,
+  phone TEXT,
+  is_pro BOOLEAN DEFAULT false,
+  pro_expiry TIMESTAMPTZ,
+  plan TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Transactions table
+CREATE TABLE transactions (
+  id BIGSERIAL PRIMARY KEY,
+  user_id UUID,
+  checkout_request_id TEXT,
+  phone TEXT,
+  amount INTEGER,
+  plan TEXT,
+  status TEXT DEFAULT 'pending',
+  mpesa_code TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  completed_at TIMESTAMPTZ
+);
+
+-- Messages table
+CREATE TABLE messages (
+  id BIGSERIAL PRIMARY KEY,
+  user_id TEXT,
+  user_name TEXT,
+  message TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Enable realtime for messages
+ALTER PUBLICATION supabase_realtime ADD TABLE messages;
